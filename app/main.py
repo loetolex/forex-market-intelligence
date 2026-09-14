@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
 from app.backtests.walk_forward import run_walk_forward_backtest
@@ -101,12 +102,14 @@ def provider_crosscheck(
 
         tiingo_last = tiingo.iloc[-1]
         twelve_last = twelve.iloc[-1]
+        tiingo_last_ts = pd.to_datetime(tiingo_last["timestamp"], utc=True)
+        twelve_last_ts = pd.to_datetime(twelve_last["timestamp"], utc=True)
 
-        result = {
+        return {
             "status": "CALCULATED",
             "symbol": normalized,
             "interval": interval,
-            "request_timestamp_utc": tiingo_last["timestamp"].isoformat() if hasattr(tiingo_last["timestamp"], "isoformat") else str(tiingo_last["timestamp"]),
+            "request_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
             "primary": {
                 "provider": "Tiingo FX",
                 "rows": int(len(tiingo)),
@@ -124,17 +127,14 @@ def provider_crosscheck(
                 "data_status": str(twelve_last["data_status"]),
             },
             "crosscheck": {
-                "timestamp_delta_minutes": abs(
-                    (pd.to_datetime(tiingo["timestamp"].max(), utc=True) - pd.to_datetime(twelve["timestamp"].max(), utc=True)).total_seconds()
-                ) / 60.0,
+                "timestamp_delta_minutes": abs((tiingo_last_ts - twelve_last_ts).total_seconds()) / 60.0,
                 "close_delta": float(tiingo_last["close"] - twelve_last["close"]),
                 "close_delta_abs": abs(float(tiingo_last["close"] - twelve_last["close"])),
-                "status": "REVIEW_REQUIRED" if str(tiingo_last["timestamp"]) != str(twelve_last["timestamp"]) else "ALIGNED",
+                "status": "REVIEW_REQUIRED" if tiingo_last_ts != twelve_last_ts else "ALIGNED",
             },
             "execution_authorized": False,
             "execution_status": "LOCKED",
         }
-        return result
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
