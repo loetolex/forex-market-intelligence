@@ -20,6 +20,16 @@ VALIDATION_FOLDS = 4
 VALIDATION_TEST = 20
 CALIBRATION_FRACTION = 0.20
 
+# Admission policy: a model must demonstrate broad, stable out-of-sample
+# evidence across all configured walk-forward folds. These thresholds are
+# deliberately stricter than the earlier candidate rule and are research
+# gates, not claims of profitability.
+MIN_VALID_FOLDS_FOR_ADMISSION = VALIDATION_FOLDS
+MIN_MEAN_BALANCED_ACCURACY = 0.55
+MIN_MEDIAN_BALANCED_ACCURACY = 0.55
+MIN_FOLD_BALANCED_ACCURACY = 0.50
+MIN_BEATS_NAIVE_RMSE_RATE = 0.75
+
 
 def _feature_frame(df: pd.DataFrame, horizon_bars: int) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     x = add_features(df.copy())
@@ -82,10 +92,6 @@ def _walk_forward_validate(X: pd.DataFrame, y_return: pd.Series, y_direction: pd
         train_classes = np.unique(ytr_d)
         test_classes = np.unique(yt_d)
 
-        # A classifier cannot be trained reliably from a single-class training set,
-        # and balanced accuracy is not valid evidence when the test set contains
-        # only one class. Mark such folds invalid instead of suppressing warnings
-        # or manufacturing a two-class score.
         if len(train_classes) < 2 or len(test_classes) < 2:
             reason = "SINGLE_CLASS_TRAIN_SET" if len(train_classes) < 2 else "SINGLE_CLASS_TEST_SET"
             invalid_folds.append({
@@ -103,14 +109,20 @@ def _walk_forward_validate(X: pd.DataFrame, y_return: pd.Series, y_direction: pd
         p = np.clip(clf.predict_proba(X.iloc[test_idx])[:, 1], 0.0, 1.0)
         r = reg.predict(X.iloc[test_idx])
         yt_r = y_return.iloc[test_idx].to_numpy()
+        train_prevalence = float(np.mean(ytr_d))
+        baseline_probability = np.full(len(yt_d), train_prevalence, dtype=float)
+
         records.append({
             "fold": fold,
             "status": "VALID",
             "train_class_count": int(len(train_classes)),
             "test_class_count": int(len(test_classes)),
+            "train_positive_rate": train_prevalence,
+            "test_positive_rate": float(np.mean(yt_d)),
             "accuracy": float(accuracy_score(yt_d, p >= 0.5)),
             "balanced_accuracy": float(balanced_accuracy_score(yt_d, p >= 0.5)),
             "brier": float(brier_score_loss(yt_d, p)),
+            "brier_baseline": float(brier_score_loss(yt_d, baseline_probability)),
             "rmse_model": float(np.sqrt(mean_squared_error(yt_r, r))),
             "rmse_naive": float(np.sqrt(mean_squared_error(yt_r, np.zeros_like(yt_r)))),
         })
@@ -121,27 +133,50 @@ def _walk_forward_validate(X: pd.DataFrame, y_return: pd.Series, y_direction: pd
             "status": "HOLD",
             "reason": "NO_VALID_TWO_CLASS_FOLDS",
             "folds": invalid_folds,
+            "fold_count": 0,
             "valid_fold_count": 0,
             "invalid_fold_count": len(invalid_folds),
         }
 
+    mean_balanced = float(frame["balanced_accuracy"].mean())
+    median_balanced = float(frame["balanced_accuracy"].median())
+    min_balanced = float(frame["balanced_accuracy"].min())
+    mean_brier = float(frame["brier"].mean())
+    mean_brier_baseline = float(frame["brier_baseline"].mean())
     beats_naive_rate = float((frame["rmse_model"] < frame["rmse_naive"]).mean())
-    candidate = bool(
-        len(frame) >= 3
-        and len(invalid_folds) == 0
-        and beats_naive_rate >= 0.75
-        and float(frame["balanced_accuracy"].mean()) > 0.50
-        and float(frame["brier"].mean()) < 0.25
-    )
+    median_rmse_model = float(frame["rmse_model"].median())
+    median_rmse_naive = float(frame["rmse_naive"].median())
+
+    admission_checks = {
+        "all_configured_folds_present": len(frame) == MIN_VALID_FOLDS_FOR_ADMISSION,
+        "no_invalid_folds": len(invalid_folds) == 0,
+        "mean_balanced_accuracy": mean_balanced >= MIN_MEAN_BALANCED_ACCURACY,
+        "median_balanced_accuracy": median_balanced >= MIN_MEDIAN_BALANCED_ACCURACY,
+        "minimum_fold_balanced_accuracy": min_balanced >= MIN_FOLD_BALANCED_ACCURACY,
+        "beats_naive_rmse_rate": beats_naive_rate >= MIN_BEATS_NAIVE_RMSE_RATE,
+        "mean_brier_beats_prevalence_baseline": mean_brier < mean_brier_baseline,
+        "median_rmse_beats_naive": median_rmse_model < median_rmse_naive,
+    }
+    failed_checks = [name for name, passed in admission_checks.items() if not passed]
+    candidate = len(failed_checks) == 0
+
     return {
         "status": "RESEARCH_CANDIDATE" if candidate else "NOT_ADMITTED",
+        "admission_policy": "STRICT_WALK_FORWARD_V1",
+        "admission_checks": admission_checks,
+        "failed_admission_checks": failed_checks,
         "folds": records + invalid_folds,
-        "fold_count": int(len(frame)),
+        "fold_count": int(len(splits)),
         "valid_fold_count": int(len(frame)),
         "invalid_fold_count": int(len(invalid_folds)),
         "beats_naive_rmse_rate": beats_naive_rate,
-        "mean_balanced_accuracy": float(frame["balanced_accuracy"].mean()),
-        "mean_brier": float(frame["brier"].mean()),
+        "mean_balanced_accuracy": mean_balanced,
+        "median_balanced_accuracy": median_balanced,
+        "min_balanced_accuracy": min_balanced,
+        "mean_brier": mean_brier,
+        "mean_brier_baseline": mean_brier_baseline,
+        "median_rmse_model": median_rmse_model,
+        "median_rmse_naive": median_rmse_naive,
         "mean_rmse_model": float(frame["rmse_model"].mean()),
         "mean_rmse_naive": float(frame["rmse_naive"].mean()),
     }
