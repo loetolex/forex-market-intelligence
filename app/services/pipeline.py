@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+
 import pandas as pd
 
 from app.config import settings
-from app.data.twelve_data import fetch_time_series
+from app.data.tiingo_fx import fetch_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.models.multi_timeframe import combine_timeframes, forecast_90d, forecast_timeframe
 from app.risk.gate import evaluate_signal
@@ -13,6 +14,7 @@ from app.risk.gate import evaluate_signal
 CANDLE_DELTAS = {
     "1h": pd.Timedelta(hours=1),
     "4h": pd.Timedelta(hours=4),
+    "1day": pd.Timedelta(days=1),
 }
 
 
@@ -24,18 +26,10 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int, interval: str) 
     if pd.isna(latest):
         raise RuntimeError("DATA UNAVAILABLE: invalid latest timestamp.")
 
-    if interval == "1day":
-        # Internally calculated daily candles are timestamped at the UTC day start.
-        # Their actual close occurs 24 hours later. Freshness is therefore measured
-        # from the calculated candle close, not from the midnight label.
-        latest_close = latest + pd.Timedelta(days=1)
-        age_minutes = (
-            datetime.now(timezone.utc) - latest_close.to_pydatetime()
-        ).total_seconds() / 60
-    else:
-        age_minutes = (
-            datetime.now(timezone.utc) - latest.to_pydatetime()
-        ).total_seconds() / 60
+    close_time = latest + CANDLE_DELTAS.get(interval, pd.Timedelta(0))
+    age_minutes = (
+        datetime.now(timezone.utc) - close_time.to_pydatetime()
+    ).total_seconds() / 60
 
     if age_minutes > max_stale_minutes:
         raise RuntimeError(
@@ -44,11 +38,7 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int, interval: str) 
 
 
 def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """Admit only closed intraday candles.
-
-    The provider timestamps are interpreted as candle-open timestamps. Current
-    incomplete bars are excluded before they can reach features or models.
-    """
+    """Admit only closed candles for any provider-supplied interval."""
     if interval not in CANDLE_DELTAS:
         return df.copy()
 
@@ -69,67 +59,50 @@ def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     return closed.reset_index(drop=True)
 
 
-def aggregate_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
-    """Build complete UTC 1-day OHLC candles from verified closed 1H REAL_DATA.
-
-    This never invents market values: open/high/low/close/volume are aggregated
-    only from provider observations. A UTC day is admitted only when all 24
-    hourly candles are present and consecutive.
-    """
+def aggregate_from_hourly(
+    df_1h: pd.DataFrame,
+    rule: str,
+    target_timeframe: str,
+    expected_bars: int,
+) -> pd.DataFrame:
+    """Aggregate complete UTC candles from verified closed Tiingo 1H REAL_DATA."""
     if df_1h.empty:
-        raise RuntimeError("DATA UNAVAILABLE: no hourly source data for daily aggregation.")
+        raise RuntimeError("DATA UNAVAILABLE: no hourly source data for aggregation.")
+    if df_1h["data_status"].ne("REAL_DATA").any():
+        raise RuntimeError("DATA UNAVAILABLE: aggregation requires REAL_DATA hourly observations.")
 
     frame = df_1h.copy()
-    if frame["data_status"].ne("REAL_DATA").any():
-        raise RuntimeError("DATA UNAVAILABLE: daily aggregation requires REAL_DATA hourly observations.")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    frame = (
+        frame.dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+    frame = frame.set_index("timestamp")
 
-    timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    frame = frame.loc[timestamps.notna()].copy()
-    frame["timestamp"] = timestamps.loc[frame.index]
-    frame = frame.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+    grouped = frame.resample(rule, label="left", closed="left").agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+    )
+    counts = frame["close"].resample(rule, label="left", closed="left").count()
+    grouped["source_row_count"] = counts
+    grouped = grouped[grouped["source_row_count"] == expected_bars]
+    grouped = grouped.drop(columns=["source_row_count"]).dropna(
+        subset=["open", "high", "low", "close"]
+    )
+    grouped = grouped.reset_index()
 
-    frame["day"] = frame["timestamp"].dt.floor("D")
-    records: list[dict] = []
-
-    for day, group in frame.groupby("day", sort=True):
-        group = group.sort_values("timestamp").reset_index(drop=True)
-        timestamps = group["timestamp"]
-
-        # A complete UTC day must contain exactly 24 hourly candles spanning
-        # 00:00 through 23:00 with no gaps or duplicates.
-        if len(group) != 24:
-            continue
-        expected = pd.date_range(day, day + pd.Timedelta(hours=23), freq="1h", tz="UTC")
-        if not timestamps.equals(pd.Series(expected)):
-            continue
-
-        record = {
-            "timestamp": day,
-            "open": float(group.iloc[0]["open"]),
-            "high": float(group["high"].max()),
-            "low": float(group["low"].min()),
-            "close": float(group.iloc[-1]["close"]),
-            "provider": "Twelve Data",
-            "instrument": str(group.iloc[0]["instrument"]),
-            "timeframe": "1day",
-            "data_status": "REAL_DATA",
-            "calculation_status": "CALCULATED",
-            "source_timeframe": "1h",
-            "source_row_count": 24,
-        }
-        if "volume" in group.columns:
-            volume = pd.to_numeric(group["volume"], errors="coerce").dropna()
-            if not volume.empty:
-                record["volume"] = float(volume.sum())
-        records.append(record)
-
-    daily = pd.DataFrame(records)
-    if daily.empty:
-        raise RuntimeError(
-            "DATA UNAVAILABLE: no complete UTC daily candles could be calculated from closed 1H data."
-        )
-
-    return daily.reset_index(drop=True)
+    grouped["provider"] = "Tiingo FX"
+    grouped["instrument"] = df_1h["instrument"].iloc[0]
+    grouped["timeframe"] = target_timeframe
+    grouped["data_status"] = "REAL_DATA"
+    grouped["source_timeframe"] = "1h"
+    grouped["calculation_status"] = "CALCULATED"
+    grouped["source_row_count"] = expected_bars
+    return grouped.reset_index(drop=True)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -141,46 +114,41 @@ def normalize_symbol(symbol: str) -> str:
 
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
-    frames: dict[str, pd.DataFrame] = {}
-    per_tf = []
 
-    # Pull the provider's verified intraday source first. This is the only source
-    # used to construct our internally calculated 1D candles.
     hourly_raw = fetch_time_series(
-        settings.twelve_data_api_key,
+        settings.tiingo_api_token,
         symbol=symbol,
         interval="1h",
-        outputsize=settings.forecast_outputsize,
+        history_days=settings.tiingo_history_days,
+        cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
     )
-    if hourly_raw["data_status"].ne("REAL_DATA").any():
-        raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
     hourly_closed = keep_closed_candles(hourly_raw, "1h")
     validate_freshness(hourly_closed, settings.max_stale_minutes, "1h")
-    frames["1h"] = hourly_closed
-    per_tf.append(forecast_timeframe(hourly_closed, symbol, "1h"))
 
-    # Keep the existing 4H provider timeframe.
+    frames: dict[str, pd.DataFrame] = {"1h": hourly_closed}
+    per_tf: list[dict] = [forecast_timeframe(hourly_closed, symbol, "1h")]
+
     if "4h" in settings.forecast_intervals:
-        raw_4h = fetch_time_series(
-            settings.twelve_data_api_key,
-            symbol=symbol,
-            interval="4h",
-            outputsize=settings.forecast_outputsize,
+        four_hour = aggregate_from_hourly(
+            hourly_closed,
+            rule="4h",
+            target_timeframe="4h",
+            expected_bars=4,
         )
-        if raw_4h["data_status"].ne("REAL_DATA").any():
-            raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
-        closed_4h = keep_closed_candles(raw_4h, "4h")
-        validate_freshness(
-            closed_4h,
-            settings.max_stale_minutes * 8,
-            "4h",
-        )
-        frames["4h"] = closed_4h
-        per_tf.append(forecast_timeframe(closed_4h, symbol, "4h"))
+        validate_freshness(four_hour, settings.max_stale_minutes * 8, "4h")
+        frames["4h"] = four_hour
+        four_hour_forecast = forecast_timeframe(four_hour, symbol, "4h")
+        four_hour_forecast["calculation_status"] = "CALCULATED"
+        four_hour_forecast["source_timeframe"] = "1h"
+        per_tf.append(four_hour_forecast)
 
-    # Option A: calculate the 1D timeframe from verified closed 1H REAL_DATA.
     if "1day" in settings.forecast_intervals:
-        daily = aggregate_daily_from_hourly(hourly_closed)
+        daily = aggregate_from_hourly(
+            hourly_closed,
+            rule="1D",
+            target_timeframe="1day",
+            expected_bars=24,
+        )
         validate_freshness(daily, settings.max_stale_minutes * 8, "1day")
         frames["1day"] = daily
         daily_forecast = forecast_timeframe(daily, symbol, "1day")
@@ -211,6 +179,7 @@ def run_market_cycle(symbol: str) -> dict:
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "instrument": symbol,
+        "market_data_provider": "Tiingo FX",
         "forecast_engine": "MULTI_TIMEFRAME_RESEARCH_CANDIDATE",
         "provenance": "REAL_DATA",
         "timeframes": settings.forecast_intervals,
@@ -218,7 +187,7 @@ def run_market_cycle(symbol: str) -> dict:
         "last_market_timestamp": {k: str(v["timestamp"].max()) for k, v in frames.items()},
         "daily_aggregation": {
             "status": "CALCULATED" if "1day" in frames else "DATA UNAVAILABLE",
-            "source": "Twelve Data 1H REAL_DATA",
+            "source": "Tiingo FX 1H REAL_DATA",
             "complete_utc_days": int(len(frames["1day"])) if "1day" in frames else 0,
         },
         "forecasts": per_tf,
