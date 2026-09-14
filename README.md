@@ -104,9 +104,8 @@ Set secrets in Railway Variables. Do not commit credentials.
 
 ## Deployment synchronization
 
-This commit is intentionally a no-code deployment trigger so the existing Railway
-`forex-api` service can pull the current `main` branch without creating another service
-or changing its environment/variables.
+Deployment synchronization marker: existing Railway `forex-api` service only.
+No new service and no environment replacement.
 
 ## Important
 
