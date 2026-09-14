@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from app.backtests.walk_forward import run_walk_forward_backtest
 from app.config import settings
-from app.data.twelve_data import fetch_time_series, inspect_time_series
+from app.data.tiingo_fx import fetch_time_series, inspect_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import normalize_symbol, run_market_cycle
 
@@ -24,6 +24,7 @@ def health():
     return {
         "status": "ok",
         "service": "forex-market-intelligence",
+        "market_data_provider": settings.market_data_provider,
         "mode": settings.trading_mode,
         "live_trading_enabled": settings.live_trading_enabled,
         "order_placement_enabled": settings.order_placement_enabled,
@@ -34,28 +35,21 @@ def health():
 @app.get("/provider/inspect/{symbol}")
 def provider_inspect(
     symbol: str,
-    interval: str = "1h",
-    outputsize: int = 10,
+    history_days: int = 7,
 ):
-    """Diagnostic-only endpoint for one Twelve Data request.
+    """Diagnostic-only Tiingo FX inspection.
 
     This bypasses the application cache and does not run forecasting,
     signal generation, risk evaluation, or execution.
     """
-    if interval not in settings.forecast_intervals:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Supported intervals: {settings.forecast_intervals}",
-        )
-    if outputsize < 1 or outputsize > 100:
-        raise HTTPException(status_code=400, detail="outputsize must be between 1 and 100.")
+    if history_days < 1 or history_days > 30:
+        raise HTTPException(status_code=400, detail="history_days must be between 1 and 30.")
 
     try:
         return inspect_time_series(
-            settings.twelve_data_api_key,
+            settings.tiingo_api_token,
             symbol=normalize_symbol(symbol),
-            interval=interval,
-            outputsize=outputsize,
+            history_days=history_days,
         )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -111,10 +105,11 @@ def backtest(symbol: str):
     symbol = normalize_symbol(symbol)
     try:
         raw = fetch_time_series(
-            settings.twelve_data_api_key,
+            settings.tiingo_api_token,
             symbol=symbol,
             interval="1h",
-            outputsize=settings.forecast_outputsize,
+            history_days=settings.tiingo_history_days,
+            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
         )
         if raw["data_status"].ne("REAL_DATA").any():
             raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
@@ -122,6 +117,7 @@ def backtest(symbol: str):
         return {
             "instrument": symbol,
             "timeframe": "1h",
+            "market_data_provider": "Tiingo FX",
             "provenance": "REAL_DATA",
             "result": result,
             "execution_authorized": False,
