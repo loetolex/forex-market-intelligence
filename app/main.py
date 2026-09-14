@@ -18,6 +18,7 @@ app = FastAPI(
 DEFAULT_PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
     "AUD/USD", "USD/CAD", "NZD/USD",
+    "EUR/GBP", "EUR/JPY", "GBP/JPY", "AUD/JPY", "NZD/JPY",
 ]
 
 
@@ -34,6 +35,8 @@ def health():
             "secondary": settings.secondary_market_data_provider,
             "tiingo_configured": bool(settings.tiingo_api_token),
             "twelve_data_configured": bool(settings.twelve_data_api_key),
+            "tiingo_history_days": settings.tiingo_history_days,
+            "fx_daily_boundary": f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}",
         },
         "broker": read_only_status().__dict__,
     }
@@ -158,8 +161,8 @@ def portfolio(
 ):
     if not symbols:
         raise HTTPException(status_code=400, detail="At least one symbol is required.")
-    if len(symbols) > 7:
-        raise HTTPException(status_code=400, detail="Maximum 7 pairs per portfolio request in this stage.")
+    if len(symbols) > len(DEFAULT_PAIRS):
+        raise HTTPException(status_code=400, detail=f"Maximum {len(DEFAULT_PAIRS)} pairs per portfolio request in this stage.")
 
     results = []
     for raw_symbol in symbols:
