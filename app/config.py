@@ -2,6 +2,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Primary market-data provider for the production research pipeline.
+    market_data_provider: str = "TIINGO"
+    tiingo_api_token: str = ""
+
+    # Retained for compatibility / future secondary-provider fallback.
     twelve_data_api_key: str = ""
     fred_api_key: str = ""
 
@@ -15,11 +20,17 @@ class Settings(BaseSettings):
 
     primary_interval: str = "1h"
     forecast_intervals: list[str] = ["1h", "4h", "1day"]
+
+    # Tiingo FX returns verified 1h historical OHLC. The 4h and 1day layers
+    # are calculated from that 1h source so the model has a consistent clock.
+    tiingo_history_days: int = 365
+    tiingo_cache_ttl_seconds: int = 300
+
     forecast_outputsize: int = 500
     max_stale_minutes: int = 180
 
-    # Twelve Data free-tier protection.
-    # Keep a safety margin below the documented 8 credits/minute limit.
+    # Legacy Twelve Data protection remains available while the provider is
+    # being phased out of the primary pipeline.
     twelve_data_requests_per_minute: int = 7
     twelve_data_cache_ttl_seconds: int = 300
     twelve_data_max_429_retries: int = 1
