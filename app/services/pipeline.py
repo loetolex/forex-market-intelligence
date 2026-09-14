@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.config import settings
@@ -13,11 +14,49 @@ from app.risk.gate import evaluate_signal
 CANDLE_DELTAS = {
     "1h": pd.Timedelta(hours=1),
     "4h": pd.Timedelta(hours=4),
-    "1day": pd.Timedelta(days=1),
 }
 
 
-def validate_freshness(df: pd.DataFrame, max_stale_minutes: int) -> None:
+def validate_freshness(df: pd.DataFrame, max_stale_minutes: int, interval: str) -> None:
+    if df.empty:
+        raise RuntimeError("DATA UNAVAILABLE: no market observations remain after validation.")
+
+    if interval == "1day":
+        # Daily bars are returned by Twelve Data using the provider/exchange
+        # local date label; timezone=UTC is ignored for 1day. Compare calendar
+        # dates in that provider timezone instead of treating the label as UTC.
+        raw_label = str(df["provider_timestamp_local"].iloc[-1]).split(" ")[0]
+        try:
+            bar_date = datetime.fromisoformat(raw_label).date()
+        except ValueError as exc:
+            raise RuntimeError("DATA UNAVAILABLE: invalid daily provider date label.") from exc
+
+        provider_tz = str(df["provider_exchange_timezone"].iloc[-1])
+        if provider_tz == "DATA_UNAVAILABLE":
+            raise RuntimeError("DATA UNAVAILABLE: daily provider timezone metadata missing.")
+
+        try:
+            current_provider_date = datetime.now(timezone.utc).astimezone(ZoneInfo(provider_tz)).date()
+        except Exception as exc:
+            raise RuntimeError(
+                f"DATA UNAVAILABLE: unsupported provider timezone '{provider_tz}'."
+            ) from exc
+
+        # The daily request already excludes the current provider-incomplete
+        # calendar day. The latest returned date must therefore be either today
+        # only if the provider has explicitly completed it, or the immediately
+        # preceding completed calendar date. Do not reject a valid completed bar
+        # solely because its exchange-local label is ahead of UTC.
+        day_age = (current_provider_date - bar_date).days
+        if day_age < 0:
+            raise RuntimeError("DATA UNAVAILABLE: daily provider date is in the future.")
+        max_daily_days = max(1, int((max_stale_minutes * 8 + 1439) // 1440))
+        if day_age > max_daily_days:
+            raise RuntimeError(
+                f"STALE_DATA: latest daily market date is {day_age} calendar days old."
+            )
+        return
+
     latest = pd.to_datetime(df["timestamp"].max(), utc=True, errors="coerce")
     if pd.isna(latest):
         raise RuntimeError("DATA UNAVAILABLE: invalid latest timestamp.")
@@ -27,12 +66,7 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int) -> None:
 
 
 def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """Admit only candles whose close time has already passed.
-
-    Twelve Data timestamps are treated as candle-open timestamps. This prevents
-    current/incomplete bars and future-dated provider rows from entering the
-    forecasting pipeline.
-    """
+    """Admit only closed intraday candles; daily bars use provider date boundaries."""
     if interval not in CANDLE_DELTAS:
         return df.copy()
 
@@ -43,9 +77,7 @@ def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     closed = df.loc[mask].copy()
 
     if closed.empty:
-        raise RuntimeError(
-            f"DATA UNAVAILABLE: no closed {interval} candles are available."
-        )
+        raise RuntimeError(f"DATA UNAVAILABLE: no closed {interval} candles are available.")
 
     if len(closed) < 20:
         raise RuntimeError(
@@ -77,7 +109,7 @@ def run_market_cycle(symbol: str) -> dict:
             raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
         raw = keep_closed_candles(raw, interval)
         freshness_limit = settings.max_stale_minutes if interval == settings.primary_interval else settings.max_stale_minutes * 8
-        validate_freshness(raw, freshness_limit)
+        validate_freshness(raw, freshness_limit, interval)
         frames[interval] = raw
         per_tf.append(forecast_timeframe(raw, symbol, interval))
 
