@@ -110,9 +110,6 @@ class ShadowQLearner:
         q = self._q(state_key)
         seen = int(self.state["stats"].get("snapshots_seen", 0))
 
-        # For an unseen state, collect a small deterministic exploration set so
-        # the learner gets evidence for all three actions without randomness
-        # influencing production decisions.
         if max(abs(float(v)) for v in q.values()) == 0.0:
             action = ACTIONS[seen % len(ACTIONS)]
             return action, "UNSEEN_STATE_EXPLORATION"
@@ -190,25 +187,33 @@ class ShadowQLearner:
         timestamp = pd_timestamp(reference_timestamp)
         state_key = build_state(hierarchical)
         settled = self._settle_ready(float(reference_price), timestamp, state_key)
-        action, selection_mode = self.choose_action(state_key)
 
         pending = self.state.setdefault("pending", [])
-        pending.append({
-            "symbol": symbol,
-            "state": state_key,
-            "action": action,
-            "entry_price": float(reference_price),
-            "timestamp": _iso(timestamp),
-        })
-        # Bound memory if the endpoint is hammered repeatedly.
-        if len(pending) > 500:
-            del pending[:-500]
+        timestamp_iso = _iso(timestamp)
+        duplicate = any(
+            str(item.get("symbol")) == symbol and str(item.get("timestamp")) == timestamp_iso
+            for item in pending
+        )
+        if duplicate:
+            action = str(next(item["action"] for item in pending if str(item.get("symbol")) == symbol and str(item.get("timestamp")) == timestamp_iso))
+            selection_mode = "EXISTING_SNAPSHOT"
+        else:
+            action, selection_mode = self.choose_action(state_key)
+            pending.append({
+                "symbol": symbol,
+                "state": state_key,
+                "action": action,
+                "entry_price": float(reference_price),
+                "timestamp": timestamp_iso,
+            })
+            if len(pending) > 500:
+                del pending[:-500]
+            self.state["stats"]["snapshots_seen"] = int(self.state["stats"].get("snapshots_seen", 0)) + 1
 
-        stats = self.state["stats"]
-        stats["snapshots_seen"] = int(stats.get("snapshots_seen", 0)) + 1
         self._save()
 
         q = self._q(state_key)
+        stats = self.state["stats"]
         return {
             "status": "SHADOW_LEARNING",
             "version": RL_VERSION,
@@ -218,7 +223,7 @@ class ShadowQLearner:
             "execution_authorized": False,
             "reward_horizon_minutes": self.reward_horizon_minutes,
             "reference_price": float(reference_price),
-            "reference_timestamp": _iso(timestamp),
+            "reference_timestamp": timestamp_iso,
             "state_key": state_key,
             "q_values": {k: float(v) for k, v in q.items()},
             "pending_experiences": len(self.state.get("pending", [])),
