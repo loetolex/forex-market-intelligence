@@ -35,7 +35,8 @@ def health():
             "secondary": settings.secondary_market_data_provider,
             "tiingo_configured": bool(settings.tiingo_api_token),
             "twelve_data_configured": bool(settings.twelve_data_api_key),
-            "tiingo_history_days": settings.tiingo_history_days,
+            "tiingo_intraday_history_days": settings.tiingo_intraday_history_days,
+            "tiingo_daily_history_days": settings.tiingo_daily_history_days,
             "fx_daily_boundary": f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}",
         },
         "broker": read_only_status().__dict__,
@@ -195,7 +196,7 @@ def backtest(symbol: str):
             settings.tiingo_api_token,
             symbol=symbol,
             interval="1h",
-            history_days=settings.tiingo_history_days,
+            history_days=settings.tiingo_intraday_history_days,
             cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
         )
         if raw["data_status"].ne("REAL_DATA").any():
