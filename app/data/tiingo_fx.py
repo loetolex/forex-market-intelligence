@@ -106,14 +106,16 @@ def _normalize(payload: list[dict], symbol: str, timeframe: str) -> pd.DataFrame
     return frame
 
 
-def _fetch_hourly(
+def _fetch_intraday(
     token: str,
     symbol: str,
+    interval: str,
+    resample_freq: str,
     history_days: int,
     cache_ttl_seconds: int,
 ) -> pd.DataFrame:
     days = max(30, int(history_days))
-    key = (_ticker(symbol), "1h", days)
+    key = (_ticker(symbol), interval, days)
     cached = _get_cached(key, cache_ttl_seconds)
     if cached is not None:
         return cached
@@ -126,13 +128,29 @@ def _fetch_hourly(
         {
             "startDate": start_date.isoformat(),
             "endDate": end_date.isoformat(),
-            "resampleFreq": "1hour",
+            "resampleFreq": resample_freq,
             "columns": "date,open,high,low,close",
         },
     )
-    frame = _normalize(payload, symbol, "1h")
+    frame = _normalize(payload, symbol, interval)
     _put_cached(key, frame, cache_ttl_seconds)
     return frame.copy(deep=True)
+
+
+def _fetch_hourly(
+    token: str,
+    symbol: str,
+    history_days: int,
+    cache_ttl_seconds: int,
+) -> pd.DataFrame:
+    return _fetch_intraday(
+        token,
+        symbol,
+        "1h",
+        "1hour",
+        history_days,
+        cache_ttl_seconds,
+    )
 
 
 def _fetch_daily_native(
@@ -224,14 +242,17 @@ def fetch_time_series(
     cache_ttl_seconds: int = 300,
 ) -> pd.DataFrame:
     interval = interval.strip().lower()
+    if interval == "15m":
+        return _fetch_intraday(api_key, symbol, "15m", "15min", history_days, cache_ttl_seconds)
+    if interval == "30m":
+        return _fetch_intraday(api_key, symbol, "30m", "30min", history_days, cache_ttl_seconds)
+    if interval == "1h":
+        return _fetch_hourly(api_key, symbol, history_days, cache_ttl_seconds)
+    if interval == "4h":
+        hourly = _fetch_hourly(api_key, symbol, history_days, cache_ttl_seconds)
+        return _aggregate_hourly(hourly, "4h", "4h", expected_bars=4)
     if interval == "1day":
         return _fetch_daily_native(api_key, symbol, history_days, cache_ttl_seconds)
-
-    hourly = _fetch_hourly(api_key, symbol, history_days, cache_ttl_seconds)
-    if interval == "1h":
-        return hourly
-    if interval == "4h":
-        return _aggregate_hourly(hourly, "4h", "4h", expected_bars=4)
     raise ProviderError(f"DATA UNAVAILABLE: unsupported Tiingo interval '{interval}'.")
 
 
@@ -252,6 +273,7 @@ def inspect_time_series(
         "provider_status": "ok",
         "data_available": True,
         "derived_intervals": ["4h"],
+        "supported_intraday_intervals": ["15m", "30m", "1h", "4h"],
         "daily_source": "Tiingo native 1day",
         "data_status": "REAL_DATA",
     }
