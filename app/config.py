@@ -6,8 +6,10 @@ class Settings(BaseSettings):
     market_data_provider: str = "TIINGO"
     tiingo_api_token: str = ""
 
-    # Retained for compatibility / future secondary-provider fallback.
+    # Secondary provider retained for independent cross-checks/failover research.
     twelve_data_api_key: str = ""
+    secondary_market_data_provider: str = "TWELVE_DATA"
+
     fred_api_key: str = ""
 
     trading_mode: str = "PAPER"
@@ -29,8 +31,8 @@ class Settings(BaseSettings):
     forecast_outputsize: int = 500
     max_stale_minutes: int = 180
 
-    # Legacy Twelve Data protection remains available while the provider is
-    # being phased out of the primary pipeline.
+    # Twelve Data request protection for secondary diagnostics/cross-checks.
+    # Keep a safety margin below the documented free-tier request ceiling.
     twelve_data_requests_per_minute: int = 7
     twelve_data_cache_ttl_seconds: int = 300
     twelve_data_max_429_retries: int = 1
