@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     twelve_data_max_429_retries: int = 1
     twelve_data_retry_wait_seconds: int = 60
 
+    # Shadow reinforcement learning. This is deliberately advisory only and
+    # cannot authorize, place, or modify broker orders.
+    rl_enabled: bool = True
+    rl_shadow_only: bool = True
+    rl_state_path: str = "/app/data/learning/rl_state.json"
+    rl_learning_rate: float = 0.10
+    rl_discount_factor: float = 0.90
+    rl_epsilon: float = 0.05
+    rl_transaction_cost_bps: float = 1.5
+    rl_reward_horizon_minutes: int = 60
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
