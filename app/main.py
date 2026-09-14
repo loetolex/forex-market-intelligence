@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
+from app.backtests.walk_forward import run_walk_forward_backtest
 from app.config import settings
+from app.data.twelve_data import fetch_time_series
 from app.execution.ibkr_readonly import read_only_status
-from app.services.pipeline import run_market_cycle
+from app.services.pipeline import normalize_symbol, run_market_cycle
 
 app = FastAPI(
     title="Forex Market Intelligence",
-    version="0.1.0",
+    version="0.2.0",
 )
+
+DEFAULT_PAIRS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "USD/CAD", "NZD/USD",
+]
 
 
 @app.get("/health")
@@ -26,17 +33,68 @@ def health():
 
 @app.get("/market/{symbol}")
 def market(symbol: str, interval: str | None = None):
-    if interval and interval != settings.primary_interval:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only configured interval {settings.primary_interval!r} is enabled in this first deployment.",
-        )
-
-    symbol = symbol.upper().replace("_", "/")
-    if "/" not in symbol and len(symbol) == 6:
-        symbol = f"{symbol[:3]}/{symbol[3:]}"
-
+    if interval and interval not in settings.forecast_intervals:
+        raise HTTPException(status_code=400, detail=f"Supported intervals: {settings.forecast_intervals}")
     try:
-        return run_market_cycle(symbol)
+        result = run_market_cycle(normalize_symbol(symbol))
+        if interval:
+            result["requested_interval"] = interval
+        return result
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/portfolio")
+def portfolio(
+    symbols: list[str] = Query(default=DEFAULT_PAIRS),
+):
+    if not symbols:
+        raise HTTPException(status_code=400, detail="At least one symbol is required.")
+    if len(symbols) > 7:
+        raise HTTPException(status_code=400, detail="Maximum 7 pairs per portfolio request in this stage.")
+
+    results = []
+    for raw_symbol in symbols:
+        symbol = normalize_symbol(raw_symbol)
+        try:
+            results.append(run_market_cycle(symbol))
+        except Exception as exc:
+            results.append({
+                "instrument": symbol,
+                "status": "DATA UNAVAILABLE",
+                "error": str(exc),
+                "execution_authorized": False,
+            })
+
+    usable = [r for r in results if r.get("status") not in {"DATA UNAVAILABLE", "NOT_ADMITTED"}]
+    return {
+        "status": "MODEL OUTPUT" if usable else "DATA UNAVAILABLE",
+        "portfolio_size": len(symbols),
+        "results": results,
+        "execution_authorized": False,
+        "execution_mode": settings.trading_mode,
+    }
+
+
+@app.get("/backtest/{symbol}")
+def backtest(symbol: str):
+    symbol = normalize_symbol(symbol)
+    try:
+        raw = fetch_time_series(
+            settings.twelve_data_api_key,
+            symbol=symbol,
+            interval="1h",
+            outputsize=settings.forecast_outputsize,
+        )
+        if raw["data_status"].ne("REAL_DATA").any():
+            raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
+        result = run_walk_forward_backtest(raw)
+        return {
+            "instrument": symbol,
+            "timeframe": "1h",
+            "provenance": "REAL_DATA",
+            "result": result,
+            "execution_authorized": False,
+        }
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
