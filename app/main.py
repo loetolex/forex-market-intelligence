@@ -38,6 +38,8 @@ def health():
             "tiingo_intraday_history_days": settings.tiingo_intraday_history_days,
             "tiingo_daily_history_days": settings.tiingo_daily_history_days,
             "fx_daily_boundary": f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}",
+            "forecast_intervals": settings.forecast_intervals,
+            "freshness_limits_minutes": settings.freshness_limits_minutes,
         },
         "broker": read_only_status().__dict__,
     }
@@ -78,8 +80,11 @@ def provider_crosscheck(
 
     This endpoint is diagnostic only. A disagreement never authorizes trading.
     """
-    if interval not in {"1h", "4h", "1day"}:
-        raise HTTPException(status_code=400, detail="Supported intervals: 1h, 4h, 1day")
+    if interval not in settings.forecast_intervals:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Supported intervals: {settings.forecast_intervals}",
+        )
     if outputsize < 2 or outputsize > 100:
         raise HTTPException(status_code=400, detail="outputsize must be between 2 and 100.")
     if not settings.tiingo_api_token:
@@ -90,11 +95,12 @@ def provider_crosscheck(
     normalized = normalize_symbol(symbol)
 
     try:
+        history_days = 30 if interval in {"15m", "30m", "1h"} else 120
         tiingo = fetch_tiingo_time_series(
             settings.tiingo_api_token,
             symbol=normalized,
             interval=interval,
-            history_days=30 if interval == "1h" else 120,
+            history_days=history_days,
             cache_ttl_seconds=0,
         )
         twelve = fetch_twelve_time_series(
