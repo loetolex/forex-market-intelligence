@@ -70,6 +70,21 @@ def _daily_end_date() -> str:
     return yesterday.isoformat()
 
 
+def _provider_interval(interval: str) -> str:
+    """Map canonical application intervals to Twelve Data interval names."""
+    mapping = {
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "4h": "4h",
+        "1day": "1day",
+    }
+    try:
+        return mapping[interval]
+    except KeyError as exc:
+        raise ProviderError(f"DATA UNAVAILABLE: unsupported Twelve Data interval '{interval}'.") from exc
+
+
 def _request_time_series(
     api_key: str,
     symbol: str,
@@ -78,15 +93,16 @@ def _request_time_series(
     end_date: str | None,
 ) -> dict:
     retries = max(0, int(settings.twelve_data_max_429_retries))
+    provider_interval = _provider_interval(interval)
     params = {
         "symbol": symbol,
-        "interval": interval,
+        "interval": provider_interval,
         "outputsize": outputsize,
         "order": "asc",
         "format": "JSON",
         "apikey": api_key,
     }
-    if interval != "1day":
+    if provider_interval != "1day":
         params["timezone"] = "UTC"
     if end_date is not None:
         params["end_date"] = end_date
@@ -204,6 +220,7 @@ def inspect_time_series(
     symbol = symbol.upper().replace("_", "/")
     interval = interval.strip().lower()
     outputsize = int(outputsize)
+    _provider_interval(interval)
     end_date = _daily_end_date() if interval == "1day" else None
     request_timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -223,6 +240,7 @@ def inspect_time_series(
         "provider": "Twelve Data",
         "symbol": symbol,
         "interval": interval,
+        "provider_interval": _provider_interval(interval),
         "returned_row_count": len(values),
         "first_timestamp": raw_timestamps[0] if raw_timestamps else "DATA UNAVAILABLE",
         "last_timestamp": raw_timestamps[-1] if raw_timestamps else "DATA UNAVAILABLE",
