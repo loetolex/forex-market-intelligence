@@ -43,11 +43,8 @@ def _classifier() -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", HistGradientBoostingClassifier(
-            learning_rate=0.05,
-            max_iter=180,
-            max_leaf_nodes=15,
-            l2_regularization=1.0,
-            random_state=42,
+            learning_rate=0.05, max_iter=180, max_leaf_nodes=15,
+            l2_regularization=1.0, random_state=42,
         )),
     ])
 
@@ -56,11 +53,8 @@ def _regressor() -> Pipeline:
     return Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("model", HistGradientBoostingRegressor(
-            learning_rate=0.05,
-            max_iter=180,
-            max_leaf_nodes=15,
-            l2_regularization=1.0,
-            random_state=42,
+            learning_rate=0.05, max_iter=180, max_leaf_nodes=15,
+            l2_regularization=1.0, random_state=42,
         )),
     ])
 
@@ -77,19 +71,17 @@ def _walk_forward_validate(X: pd.DataFrame, y_return: pd.Series, y_direction: pd
         splits.append((np.arange(train_end), np.arange(test_start, test_end)))
         train_end += VALIDATION_TEST
 
-    records = []
     if not splits:
         return {"status": "HOLD", "reason": "INSUFFICIENT_WALK_FORWARD_HISTORY", "folds": []}
 
+    records = []
     for fold, (train_idx, test_idx) in enumerate(splits, start=1):
-        clf = _classifier()
-        reg = _regressor()
+        clf, reg = _classifier(), _regressor()
         clf.fit(X.iloc[train_idx], y_direction.iloc[train_idx])
         reg.fit(X.iloc[train_idx], y_return.iloc[train_idx])
         p = np.clip(clf.predict_proba(X.iloc[test_idx])[:, 1], 0.0, 1.0)
         r = reg.predict(X.iloc[test_idx])
-        yt_d = y_direction.iloc[test_idx].to_numpy()
-        yt_r = y_return.iloc[test_idx].to_numpy()
+        yt_d, yt_r = y_direction.iloc[test_idx].to_numpy(), y_return.iloc[test_idx].to_numpy()
         records.append({
             "fold": fold,
             "accuracy": float(accuracy_score(yt_d, p >= 0.5)),
@@ -124,15 +116,14 @@ def _calibrate_probability(raw_probability: float, X: pd.DataFrame, y_direction:
     cal_start = max(int(n * (1.0 - CALIBRATION_FRACTION)), MIN_TRAIN)
     if cal_start >= n - 10:
         return raw_probability, {"status": "NOT_CALIBRATED", "reason": "INSUFFICIENT_CALIBRATION_HISTORY"}
-    train_idx = np.arange(cal_start)
-    cal_idx = np.arange(cal_start, n)
+    train_idx, cal_idx = np.arange(cal_start), np.arange(cal_start, n)
     clf = _classifier()
     clf.fit(X.iloc[train_idx], y_direction.iloc[train_idx])
     p_cal = np.clip(clf.predict_proba(X.iloc[cal_idx])[:, 1], 1e-6, 1 - 1e-6)
     y_cal = y_direction.iloc[cal_idx].to_numpy()
-    logits = np.log(p_cal / (1.0 - p_cal)).reshape(-1, 1)
     if len(np.unique(y_cal)) < 2:
         return raw_probability, {"status": "NOT_CALIBRATED", "reason": "CALIBRATION_SET_SINGLE_CLASS"}
+    logits = np.log(p_cal / (1.0 - p_cal)).reshape(-1, 1)
     calibrator = Pipeline([
         ("scale", StandardScaler()),
         ("logistic", LogisticRegression(random_state=42)),
@@ -141,12 +132,7 @@ def _calibrate_probability(raw_probability: float, X: pd.DataFrame, y_direction:
     raw = float(np.clip(raw_probability, 1e-6, 1 - 1e-6))
     calibrated = float(calibrator.predict_proba(np.array([[np.log(raw / (1 - raw))]]))[:, 1][0])
     brier = float(brier_score_loss(y_cal, calibrator.predict_proba(logits)[:, 1]))
-    return calibrated, {
-        "status": "CALIBRATED",
-        "method": "platt_scaling",
-        "calibration_rows": int(len(cal_idx)),
-        "brier": brier,
-    }
+    return calibrated, {"status": "CALIBRATED", "method": "platt_scaling", "calibration_rows": int(len(cal_idx)), "brier": brier}
 
 
 def _regime(df: pd.DataFrame) -> dict[str, Any]:
@@ -156,8 +142,7 @@ def _regime(df: pd.DataFrame) -> dict[str, Any]:
         return {"status": "DATA UNAVAILABLE", "regime": "UNKNOWN"}
     last = x.iloc[-1]
     atr_pct = float(last["atr_pct"]) if pd.notna(last["atr_pct"]) else np.nan
-    low = float(atr.quantile(0.20))
-    high = float(atr.quantile(0.80))
+    low, high = float(atr.quantile(0.20)), float(atr.quantile(0.80))
     if np.isfinite(atr_pct) and atr_pct >= high:
         state = "HIGH_VOLATILITY"
     elif np.isfinite(atr_pct) and atr_pct <= low:
@@ -169,19 +154,13 @@ def _regime(df: pd.DataFrame) -> dict[str, Any]:
     return {"status": "CALCULATED", "regime": state, "atr_pct": atr_pct}
 
 
-def forecast_timeframe(df: pd.DataFrame, instrument: str, timeframe: str) -> dict[str, Any]:
-    X, y_return, y_direction = _feature_frame(df, horizon_bars=1)
+def forecast_timeframe(df: pd.DataFrame, instrument: str, timeframe: str, horizon_bars: int = 1) -> dict[str, Any]:
+    X, y_return, y_direction = _feature_frame(df, horizon_bars=horizon_bars)
     base = {
-        "instrument": instrument,
-        "timeframe": timeframe,
-        "model_version": MODEL_VERSION,
-        "status": "DATA UNAVAILABLE",
-        "probability_up": None,
-        "probability_down": None,
-        "expected_return": None,
-        "expected_abs_move": None,
-        "uncertainty": None,
-        "confidence": None,
+        "instrument": instrument, "timeframe": timeframe, "horizon_bars": horizon_bars,
+        "model_version": MODEL_VERSION, "status": "DATA UNAVAILABLE",
+        "probability_up": None, "probability_down": None, "expected_return": None,
+        "expected_abs_move": None, "uncertainty": None, "confidence": None,
         "regime": _regime(df),
     }
     if len(X) < MIN_ROWS or y_direction.nunique() < 2:
@@ -189,11 +168,9 @@ def forecast_timeframe(df: pd.DataFrame, instrument: str, timeframe: str) -> dic
         return base
 
     validation = _walk_forward_validate(X, y_return, y_direction)
-    clf = _classifier()
-    reg = _regressor()
+    clf, reg = _classifier(), _regressor()
     fit_end = max(int(len(X) * (1.0 - CALIBRATION_FRACTION)), MIN_TRAIN)
-    if fit_end >= len(X):
-        fit_end = len(X) - 1
+    fit_end = min(fit_end, len(X) - 1)
     clf.fit(X.iloc[:fit_end], y_direction.iloc[:fit_end])
     reg.fit(X.iloc[:fit_end], y_return.iloc[:fit_end])
     latest = X.tail(1)
@@ -223,25 +200,21 @@ def forecast_timeframe(df: pd.DataFrame, instrument: str, timeframe: str) -> dic
 def combine_timeframes(forecasts: list[dict[str, Any]]) -> dict[str, Any]:
     usable = [x for x in forecasts if x.get("status") == "MODEL OUTPUT" and x.get("probability_up") is not None]
     if not usable:
-        return {
-            "status": "DATA UNAVAILABLE",
-            "probability_up": None,
-            "probability_down": None,
-            "agreement": 0.0,
-            "timeframes": 0,
-            "validation_status": "HOLD",
-        }
+        return {"status": "DATA UNAVAILABLE", "probability_up": None, "probability_down": None, "agreement": 0.0, "timeframes": 0, "validation_status": "HOLD"}
     p = np.array([float(x["probability_up"]) for x in usable])
     combined = float(np.mean(p))
     directions = np.array([v >= 0.5 for v in p], dtype=int)
     agreement = float(max(directions.mean(), 1.0 - directions.mean()))
     all_admitted = all(x.get("validation_status") == "RESEARCH_CANDIDATE" for x in usable)
     return {
-        "status": "MODEL OUTPUT",
-        "probability_up": combined,
-        "probability_down": 1.0 - combined,
-        "agreement": agreement,
-        "timeframes": len(usable),
+        "status": "MODEL OUTPUT", "probability_up": combined, "probability_down": 1.0 - combined,
+        "agreement": agreement, "timeframes": len(usable),
         "validation_status": "RESEARCH_CANDIDATE" if all_admitted else "NOT_ADMITTED",
         "models": [x["timeframe"] for x in usable],
     }
+
+
+def forecast_90d(df: pd.DataFrame, instrument: str) -> dict[str, Any]:
+    result = forecast_timeframe(df, instrument, "90D", horizon_bars=90)
+    result["horizon"] = "90D"
+    return result
