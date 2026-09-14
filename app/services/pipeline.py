@@ -80,13 +80,7 @@ def _fx_session_window(session_date: date, boundary_tz: ZoneInfo, boundary_hour:
 
 
 def aggregate_fx_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
-    """Build canonical FX trading-day candles from verified closed 1H REAL_DATA.
-
-    The canonical FX day is defined by a DST-aware local boundary (default
-    17:00 America/New_York). The expected hourly bar count is calculated from
-    the actual UTC session duration, so DST transition sessions can contain
-    23 or 25 hourly bars without being incorrectly rejected.
-    """
+    """Build canonical FX trading-day candles from verified closed 1H REAL_DATA."""
     if df_1h.empty:
         raise RuntimeError("DATA UNAVAILABLE: no hourly source data for daily aggregation.")
     if df_1h["data_status"].ne("REAL_DATA").any():
@@ -107,7 +101,6 @@ def aggregate_fx_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
     )
 
     local_ts = frame["timestamp"].dt.tz_convert(boundary_tz)
-    # Session date changes at the configured local boundary, not at UTC midnight.
     session_date = (local_ts - pd.Timedelta(hours=boundary_hour)).dt.date
     frame["session_date"] = session_date
 
@@ -122,11 +115,8 @@ def aggregate_fx_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
             tz="UTC",
         )
         expected_count = len(expected_index)
-
         timestamps = group["timestamp"].reset_index(drop=True)
-        if len(group) != expected_count:
-            continue
-        if not timestamps.equals(pd.Series(expected_index, name=None)):
+        if len(group) != expected_count or not timestamps.equals(pd.Series(expected_index, name=None)):
             continue
 
         record = {
@@ -153,23 +143,13 @@ def aggregate_fx_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
 
     daily = pd.DataFrame(records)
     if daily.empty:
-        raise RuntimeError(
-            "DATA UNAVAILABLE: no complete canonical FX daily candles could be calculated from closed 1H data."
-        )
-
+        raise RuntimeError("DATA UNAVAILABLE: no complete canonical FX daily candles could be calculated from closed 1H data.")
     return daily.reset_index(drop=True)
 
 
-def aggregate_from_hourly(
-    df_1h: pd.DataFrame,
-    rule: str,
-    target_timeframe: str,
-    expected_bars: int,
-) -> pd.DataFrame:
-    """Aggregate complete fixed-duration candles from verified closed 1H data."""
+def aggregate_from_hourly(df_1h: pd.DataFrame, rule: str, target_timeframe: str, expected_bars: int) -> pd.DataFrame:
     if target_timeframe == "1day":
         return aggregate_fx_daily_from_hourly(df_1h)
-
     if df_1h.empty:
         raise RuntimeError("DATA UNAVAILABLE: no hourly source data for aggregation.")
     if df_1h["data_status"].ne("REAL_DATA").any():
@@ -184,7 +164,6 @@ def aggregate_from_hourly(
         .reset_index(drop=True)
         .set_index("timestamp")
     )
-
     grouped = frame.resample(rule, label="left", closed="left").agg(
         open=("open", "first"),
         high=("high", "max"),
@@ -194,9 +173,7 @@ def aggregate_from_hourly(
     counts = frame["close"].resample(rule, label="left", closed="left").count()
     grouped["source_row_count"] = counts
     grouped = grouped[grouped["source_row_count"] == expected_bars]
-    grouped = grouped.drop(columns=["source_row_count"]).dropna(
-        subset=["open", "high", "low", "close"]
-    )
+    grouped = grouped.drop(columns=["source_row_count"]).dropna(subset=["open", "high", "low", "close"])
     grouped = grouped.reset_index()
     grouped["bar_end_timestamp"] = grouped["timestamp"] + pd.Timedelta(hours=4)
     grouped["provider"] = "Tiingo FX"
@@ -219,11 +196,13 @@ def normalize_symbol(symbol: str) -> str:
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
 
+    # Recent intraday source is intentionally bounded. A large 1H request can
+    # return an old tail from the provider, causing a false stale-data failure.
     hourly_raw = fetch_time_series(
         settings.tiingo_api_token,
         symbol=symbol,
         interval="1h",
-        history_days=settings.tiingo_history_days,
+        history_days=settings.tiingo_intraday_history_days,
         cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
     )
     hourly_closed = keep_closed_candles(hourly_raw, "1h")
@@ -233,43 +212,45 @@ def run_market_cycle(symbol: str) -> dict:
     per_tf: list[dict] = [forecast_timeframe(hourly_closed, symbol, "1h")]
 
     if "4h" in settings.forecast_intervals:
-        four_hour = aggregate_from_hourly(
-            hourly_closed,
-            rule="4h",
-            target_timeframe="4h",
-            expected_bars=4,
-        )
+        four_hour = aggregate_from_hourly(hourly_closed, "4h", "4h", expected_bars=4)
         validate_freshness(four_hour, settings.max_stale_minutes * 8, "4h")
         frames["4h"] = four_hour
-        four_hour_forecast = forecast_timeframe(four_hour, symbol, "4h")
-        four_hour_forecast["calculation_status"] = "CALCULATED"
-        four_hour_forecast["source_timeframe"] = "1h"
-        per_tf.append(four_hour_forecast)
+        forecast_4h = forecast_timeframe(four_hour, symbol, "4h")
+        forecast_4h["calculation_status"] = "CALCULATED"
+        forecast_4h["source_timeframe"] = "1h"
+        per_tf.append(forecast_4h)
 
     if "1day" in settings.forecast_intervals:
-        daily = aggregate_from_hourly(
-            hourly_closed,
-            rule="1D",
-            target_timeframe="1day",
-            expected_bars=24,
+        # Native Tiingo daily history is used for the long-horizon layer because
+        # it is dramatically cheaper than requesting 1095 calendar days of 1H data.
+        # The canonical session close is represented at 17:00 New York time.
+        daily = fetch_time_series(
+            settings.tiingo_api_token,
+            symbol=symbol,
+            interval="1day",
+            history_days=settings.tiingo_daily_history_days,
+            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
         )
+        daily = daily.loc[daily["data_status"].eq("REAL_DATA")].copy()
+        if daily.empty:
+            raise RuntimeError("DATA UNAVAILABLE: no completed Tiingo daily FX sessions are available.")
         validate_freshness(daily, settings.max_stale_minutes * 8, "1day")
         frames["1day"] = daily
         daily_forecast = forecast_timeframe(daily, symbol, "1day")
-        daily_forecast["calculation_status"] = "CALCULATED"
-        daily_forecast["source_timeframe"] = "1h"
+        daily_forecast["calculation_status"] = "SOURCE"
+        daily_forecast["source_timeframe"] = "1day"
+        daily_forecast["fx_daily_boundary"] = f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
         per_tf.append(daily_forecast)
 
     combined = combine_timeframes(per_tf)
     daily = frames.get("1day")
-    long_horizon = (
-        forecast_90d(daily, symbol)
-        if daily is not None
-        else {"status": "DATA UNAVAILABLE", "reason": "DAILY_DATA_MISSING", "horizon": "90D"}
-    )
+    long_horizon = forecast_90d(daily, symbol) if daily is not None else {
+        "status": "DATA UNAVAILABLE", "reason": "DAILY_DATA_MISSING", "horizon": "90D"
+    }
     if daily is not None:
-        long_horizon["calculation_status"] = "CALCULATED"
-        long_horizon["source_timeframe"] = "1h"
+        long_horizon["calculation_status"] = "SOURCE"
+        long_horizon["source_timeframe"] = "1day"
+        long_horizon["fx_daily_boundary"] = f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
 
     p = combined.get("probability_up")
     agreement = float(combined.get("agreement", 0.0))
@@ -290,8 +271,8 @@ def run_market_cycle(symbol: str) -> dict:
         "market_rows": {k: len(v) for k, v in frames.items()},
         "last_market_timestamp": {k: str(v["timestamp"].max()) for k, v in frames.items()},
         "daily_aggregation": {
-            "status": "CALCULATED" if "1day" in frames else "DATA UNAVAILABLE",
-            "source": "Tiingo FX 1H REAL_DATA",
+            "status": "SOURCE" if "1day" in frames else "DATA UNAVAILABLE",
+            "source": "Tiingo FX native 1day REAL_DATA" if "1day" in frames else "DATA UNAVAILABLE",
             "complete_fx_sessions": int(len(frames["1day"])) if "1day" in frames else 0,
             "boundary": f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}",
         },
