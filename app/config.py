@@ -20,11 +20,13 @@ class Settings(BaseSettings):
     ibkr_port: int = 7497
     ibkr_client_id: int = 901
 
-    primary_interval: str = "1h"
-    forecast_intervals: list[str] = ["1h", "4h", "1day"]
+    primary_interval: str = "15m"
+    # Operational multi-timeframe stack: 15m / 30m / 1h / 4h / 1day.
+    # 90D remains a separate long-horizon research output, not an execution timeframe.
+    forecast_intervals: list[str] = ["15m", "30m", "1h", "4h", "1day"]
 
-    # Keep the intraday request bounded for reliable real-time freshness.
-    # Long-horizon research uses the native Tiingo daily endpoint separately.
+    # Keep intraday history bounded for reliable real-time freshness.
+    # Daily research uses the native Tiingo daily endpoint separately.
     tiingo_intraday_history_days: int = 365
     tiingo_daily_history_days: int = 1095
     tiingo_cache_ttl_seconds: int = 300
@@ -36,6 +38,15 @@ class Settings(BaseSettings):
 
     forecast_outputsize: int = 500
     max_stale_minutes: int = 180
+
+    # Timeframe-specific freshness limits for the operational stack.
+    freshness_limits_minutes: dict[str, int] = {
+        "15m": 45,
+        "30m": 90,
+        "1h": 180,
+        "4h": 1440,
+        "1day": 1440,
+    }
 
     # Twelve Data request protection for secondary diagnostics/cross-checks.
     # Keep a safety margin below the documented free-tier request ceiling.
