@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timezone
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -9,6 +10,8 @@ from app.config import settings
 from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_readonly import read_only_status
+from app.learning.rl_agent import ShadowQLearner
+from app.models.hierarchy import build_hierarchical_decision
 from app.models.multi_timeframe import combine_timeframes, forecast_90d, forecast_timeframe
 from app.risk.gate import evaluate_signal
 
@@ -19,6 +22,16 @@ CANDLE_DELTAS = {
     "1h": pd.Timedelta(hours=1),
     "4h": pd.Timedelta(hours=4),
 }
+
+_RL_LOCK = Lock()
+_RL_LEARNER = ShadowQLearner(
+    path=settings.rl_state_path,
+    learning_rate=settings.rl_learning_rate,
+    discount_factor=settings.rl_discount_factor,
+    epsilon=settings.rl_epsilon,
+    transaction_cost_bps=settings.rl_transaction_cost_bps,
+    reward_horizon_minutes=settings.rl_reward_horizon_minutes,
+)
 
 
 def _fx_boundary_tz() -> ZoneInfo:
@@ -204,14 +217,31 @@ def _annotate_provider(forecast: dict, provider: str) -> dict:
     return forecast
 
 
+def _run_shadow_learning(symbol: str, hierarchical: dict, frame_15m: pd.DataFrame) -> dict:
+    if not settings.rl_enabled or not settings.rl_shadow_only:
+        return {
+            "status": "DISABLED",
+            "advisory_only": True,
+            "execution_authorized": False,
+        }
+
+    reference_timestamp = frame_15m["bar_end_timestamp"].max()
+    reference_price = float(frame_15m["close"].iloc[-1])
+    with _RL_LOCK:
+        return _RL_LEARNER.process_snapshot(
+            symbol=symbol,
+            hierarchical=hierarchical,
+            reference_price=reference_price,
+            reference_timestamp=reference_timestamp,
+        )
+
+
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
 
     frames: dict[str, pd.DataFrame] = {}
     per_tf: list[dict] = []
 
-    # 15m and 30m use the current secondary intraday feed because the Tiingo
-    # 15m response was materially stale. Freshness is still enforced.
     if "15m" in settings.forecast_intervals:
         fifteen = _fetch_operational_intraday(symbol, "15m")
         fifteen = keep_closed_candles(fifteen, "15m")
@@ -286,6 +316,8 @@ def run_market_cycle(symbol: str) -> dict:
         per_tf.append(_annotate_provider(daily_forecast, "Tiingo FX"))
 
     combined = combine_timeframes(per_tf)
+    hierarchical = build_hierarchical_decision(per_tf)
+
     daily = frames.get("1day")
     long_horizon = forecast_90d(daily, symbol) if daily is not None else {
         "status": "DATA UNAVAILABLE", "reason": "DAILY_DATA_MISSING", "horizon": "90D"
@@ -296,12 +328,18 @@ def run_market_cycle(symbol: str) -> dict:
         long_horizon["fx_daily_boundary"] = f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
         long_horizon["market_data_provider"] = "Tiingo FX"
 
-    p = combined.get("probability_up")
-    agreement = float(combined.get("agreement", 0.0))
-    candidate_signal = "NO TRADE"
-    if p is not None and abs(float(p) - 0.50) >= 0.10 and agreement >= 0.67:
-        candidate_signal = "LONG CANDIDATE" if float(p) > 0.50 else "SHORT CANDIDATE"
+    if "15m" in frames:
+        shadow_learning = _run_shadow_learning(symbol, hierarchical, frames["15m"])
+    else:
+        shadow_learning = {
+            "status": "HOLD",
+            "reason": "15M_TIMEFRAME_UNAVAILABLE",
+            "advisory_only": True,
+            "execution_authorized": False,
+        }
 
+    p = hierarchical.get("probability_up")
+    candidate_signal = hierarchical.get("candidate_signal", "NO TRADE")
     risk = evaluate_signal(p)
     final_decision = candidate_signal if risk.approved else "NO TRADE"
 
@@ -322,10 +360,14 @@ def run_market_cycle(symbol: str) -> dict:
         },
         "forecasts": per_tf,
         "combined_forecast": combined,
+        "hierarchical_forecast": hierarchical,
+        "reinforcement_learning": shadow_learning,
         "forecast_90d": long_horizon,
         "signal_engine": {
             "candidate_signal": candidate_signal,
-            "rule": "edge >= 10 percentage points and timeframe agreement >= 67%",
+            "rule": hierarchical.get("decision_rule"),
+            "policy_source": "HIERARCHICAL_DECISION_ENGINE",
+            "rl_override": False,
         },
         "risk": {"approved": risk.approved, "reason": risk.reason},
         "decision": final_decision,
