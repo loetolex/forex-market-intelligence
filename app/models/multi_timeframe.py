@@ -17,6 +17,7 @@ CALIBRATION_FRACTION = 0.20
 
 FEATURES = ["return_1", "return_3", "return_6", "volatility_10", "sma_10_ratio", "sma_30_ratio", "range_pct"]
 
+
 def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     frame = df.copy()
     frame["return_1"] = frame["close"].pct_change()
@@ -28,12 +29,14 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     frame["range_pct"] = (frame["high"] - frame["low"]) / frame["close"]
     return frame
 
+
 def _prepare_supervised(df: pd.DataFrame, horizon_bars: int = 1):
     frame = _feature_frame(df)
     frame["future_return"] = frame["close"].shift(-horizon_bars) / frame["close"] - 1.0
     frame["target"] = (frame["future_return"] > 0).astype(int)
     frame = frame.dropna(subset=FEATURES + ["future_return"])
     return frame, frame[FEATURES], frame["target"]
+
 
 def _walk_forward_validate(X: pd.DataFrame, y: pd.Series, returns: pd.Series | None = None) -> dict[str, Any]:
     rows = []
@@ -61,6 +64,7 @@ def _walk_forward_validate(X: pd.DataFrame, y: pd.Series, returns: pd.Series | N
         rows.append(row)
     return {"folds": rows, "mean_accuracy": float(np.mean([r["accuracy"] for r in rows])) if rows else None, "mean_balanced_accuracy": float(np.mean([r["balanced_accuracy"] for r in rows])) if rows else None, "mean_brier": float(np.mean([r["brier"] for r in rows])) if rows else None, "beats_naive_rate": float(np.mean([r.get("beats_naive", False) for r in rows])) if rows else 0.0}
 
+
 def _calibrate_probability(X: pd.DataFrame, y: pd.Series, model):
     n_cal = max(20, int(len(X) * CALIBRATION_FRACTION))
     if len(X) <= n_cal + MIN_TRAIN or y.iloc[-n_cal:].nunique() < 2:
@@ -77,6 +81,7 @@ def _calibrate_probability(X: pd.DataFrame, y: pd.Series, model):
     calibrated = calibrator.predict_proba(raw_prob.reshape(-1, 1))[:, 1]
     return (model, calibrator), {"status": "CALIBRATED", "rows": len(X_cal), "brier": float(brier_score_loss(y_cal, calibrated))}
 
+
 def _regime(df: pd.DataFrame) -> str:
     returns = df["close"].pct_change().dropna()
     if len(returns) < 30: return "UNKNOWN"
@@ -86,6 +91,7 @@ def _regime(df: pd.DataFrame) -> str:
     if trend < -0.002: return "TREND_DOWN"
     if long_vol and vol < long_vol * 0.65: return "LOW_VOLATILITY"
     return "RANGE"
+
 
 def forecast_timeframe(df: pd.DataFrame, symbol: str, interval: str, horizon_bars: int = 1) -> dict:
     if len(df) < MIN_ROWS: return {"status":"DATA UNAVAILABLE","reason":"INSUFFICIENT_ROWS","symbol":symbol,"interval":interval}
@@ -98,11 +104,13 @@ def forecast_timeframe(df: pd.DataFrame, symbol: str, interval: str, horizon_bar
     probability_up = float(model.predict_proba(X.tail(1))[:, 1][0])
     return {"status":"MODEL OUTPUT","symbol":symbol,"interval":interval,"model_version":MODEL_VERSION,"probability_up":probability_up,"probability_down":1-probability_up,"expected_return":float(frame["future_return"].tail(min(20,len(frame))).mean()),"confidence":float(abs(probability_up-.5)*2),"regime":_regime(df),"validation":{**validation,"status":"ADMITTED" if candidate else "NOT_ADMITTED","candidate":candidate},"data_status":"REAL_DATA","output_status":"MODEL OUTPUT"}
 
+
 def combine_timeframes(per_tf: list[dict]) -> dict:
     usable=[x for x in per_tf if x.get("status")=="MODEL OUTPUT" and x.get("probability_up") is not None]
     if not usable:return {"status":"DATA UNAVAILABLE","probability_up":None,"probability_down":None,"agreement":0.0}
     probs=[float(x["probability_up"]) for x in usable]; p=float(np.mean(probs)); directions=[v>=.5 for v in probs]; agreement=float(max(sum(directions),len(directions)-sum(directions))/len(directions)); admitted=all(x.get("validation",{}).get("status")=="ADMITTED" for x in usable)
     return {"status":"MODEL OUTPUT","probability_up":p,"probability_down":1-p,"agreement":agreement,"validation":{"status":"ADMITTED" if admitted else "NOT_ADMITTED"}}
+
 
 def forecast_90d(df: pd.DataFrame, symbol: str) -> dict:
     result=forecast_timeframe(df,symbol,"90D",horizon_bars=90); result["horizon"]="90D"; return result
