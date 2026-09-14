@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.config import settings
-from app.data.tiingo_fx import fetch_time_series
+from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series
+from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.models.multi_timeframe import combine_timeframes, forecast_90d, forecast_timeframe
 from app.risk.gate import evaluate_signal
@@ -157,7 +158,7 @@ def aggregate_from_frame(
     grouped = grouped.drop(columns=["source_row_count"]).dropna(subset=["open", "high", "low", "close"])
     grouped = grouped.reset_index()
     grouped["bar_end_timestamp"] = grouped["timestamp"] + CANDLE_DELTAS[target_timeframe]
-    grouped["provider"] = "Tiingo FX"
+    grouped["provider"] = str(source_frame["provider"].iloc[0])
     grouped["instrument"] = source_frame["instrument"].iloc[0]
     grouped["timeframe"] = target_timeframe
     grouped["data_status"] = "REAL_DATA"
@@ -178,42 +179,61 @@ def _freshness_limit(interval: str) -> int:
     return int(settings.freshness_limits_minutes.get(interval, settings.max_stale_minutes))
 
 
+def _fetch_operational_intraday(symbol: str, interval: str) -> pd.DataFrame:
+    """Fetch current 15m/30m candles from the secondary real-data feed.
+
+    Tiingo remains the proven source for 1h and native 1day data. The observed
+    Tiingo 15m feed was stale, so 15m/30m use Twelve Data directly rather than
+    accepting stale candles or silently weakening freshness gates.
+    """
+    if interval not in {"15m", "30m"}:
+        raise RuntimeError(f"DATA UNAVAILABLE: unsupported operational intraday interval '{interval}'.")
+
+    frame = fetch_twelve_time_series(
+        settings.twelve_data_api_key,
+        symbol=symbol,
+        interval=interval,
+        outputsize=5000,
+    )
+    frame["data_status"] = "REAL_DATA"
+    return frame
+
+
+def _annotate_provider(forecast: dict, provider: str) -> dict:
+    forecast["market_data_provider"] = provider
+    return forecast
+
+
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
 
     frames: dict[str, pd.DataFrame] = {}
     per_tf: list[dict] = []
 
-    # Each operational timeframe is fetched/derived sequentially. This avoids
-    # parallel provider pressure while keeping the five-timeframe stack explicit.
+    # 15m and 30m use the current secondary intraday feed because the Tiingo
+    # 15m response was materially stale. Freshness is still enforced.
     if "15m" in settings.forecast_intervals:
-        fifteen = fetch_time_series(
-            settings.tiingo_api_token,
-            symbol=symbol,
-            interval="15m",
-            history_days=settings.tiingo_intraday_history_days,
-            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
-        )
+        fifteen = _fetch_operational_intraday(symbol, "15m")
         fifteen = keep_closed_candles(fifteen, "15m")
         validate_freshness(fifteen, _freshness_limit("15m"), "15m")
         frames["15m"] = fifteen
-        per_tf.append(forecast_timeframe(fifteen, symbol, "15m"))
+        per_tf.append(_annotate_provider(
+            forecast_timeframe(fifteen, symbol, "15m"),
+            "Twelve Data",
+        ))
 
     if "30m" in settings.forecast_intervals:
-        thirty = fetch_time_series(
-            settings.tiingo_api_token,
-            symbol=symbol,
-            interval="30m",
-            history_days=settings.tiingo_intraday_history_days,
-            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
-        )
+        thirty = _fetch_operational_intraday(symbol, "30m")
         thirty = keep_closed_candles(thirty, "30m")
         validate_freshness(thirty, _freshness_limit("30m"), "30m")
         frames["30m"] = thirty
-        per_tf.append(forecast_timeframe(thirty, symbol, "30m"))
+        per_tf.append(_annotate_provider(
+            forecast_timeframe(thirty, symbol, "30m"),
+            "Twelve Data",
+        ))
 
     if "1h" in settings.forecast_intervals:
-        hourly = fetch_time_series(
+        hourly = fetch_tiingo_time_series(
             settings.tiingo_api_token,
             symbol=symbol,
             interval="1h",
@@ -223,12 +243,15 @@ def run_market_cycle(symbol: str) -> dict:
         hourly = keep_closed_candles(hourly, "1h")
         validate_freshness(hourly, _freshness_limit("1h"), "1h")
         frames["1h"] = hourly
-        per_tf.append(forecast_timeframe(hourly, symbol, "1h"))
+        per_tf.append(_annotate_provider(
+            forecast_timeframe(hourly, symbol, "1h"),
+            "Tiingo FX",
+        ))
 
     if "4h" in settings.forecast_intervals:
         hourly_source = frames.get("1h")
         if hourly_source is None:
-            hourly_source = fetch_time_series(
+            hourly_source = fetch_tiingo_time_series(
                 settings.tiingo_api_token,
                 symbol=symbol,
                 interval="1h",
@@ -242,10 +265,10 @@ def run_market_cycle(symbol: str) -> dict:
         forecast_4h = forecast_timeframe(four_hour, symbol, "4h")
         forecast_4h["calculation_status"] = "CALCULATED"
         forecast_4h["source_timeframe"] = "1h"
-        per_tf.append(forecast_4h)
+        per_tf.append(_annotate_provider(forecast_4h, str(hourly_source["provider"].iloc[0])))
 
     if "1day" in settings.forecast_intervals:
-        daily = fetch_time_series(
+        daily = fetch_tiingo_time_series(
             settings.tiingo_api_token,
             symbol=symbol,
             interval="1day",
@@ -260,7 +283,7 @@ def run_market_cycle(symbol: str) -> dict:
         daily_forecast["calculation_status"] = "SOURCE"
         daily_forecast["source_timeframe"] = "1day"
         daily_forecast["fx_daily_boundary"] = f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
-        per_tf.append(daily_forecast)
+        per_tf.append(_annotate_provider(daily_forecast, "Tiingo FX"))
 
     combined = combine_timeframes(per_tf)
     daily = frames.get("1day")
@@ -271,6 +294,7 @@ def run_market_cycle(symbol: str) -> dict:
         long_horizon["calculation_status"] = "SOURCE"
         long_horizon["source_timeframe"] = "1day"
         long_horizon["fx_daily_boundary"] = f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
+        long_horizon["market_data_provider"] = "Tiingo FX"
 
     p = combined.get("probability_up")
     agreement = float(combined.get("agreement", 0.0))
@@ -284,7 +308,7 @@ def run_market_cycle(symbol: str) -> dict:
     return {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "instrument": symbol,
-        "market_data_provider": "Tiingo FX",
+        "market_data_provider": "Twelve Data (15m/30m) + Tiingo FX (1h/4h/1day)",
         "forecast_engine": "MULTI_TIMEFRAME_RESEARCH_CANDIDATE",
         "provenance": "REAL_DATA",
         "timeframes": settings.forecast_intervals,
