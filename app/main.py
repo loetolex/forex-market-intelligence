@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from app.backtests.walk_forward import run_walk_forward_backtest
 from app.config import settings
-from app.data.twelve_data import fetch_time_series
+from app.data.twelve_data import fetch_time_series, inspect_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import normalize_symbol, run_market_cycle
 
@@ -29,6 +29,36 @@ def health():
         "order_placement_enabled": settings.order_placement_enabled,
         "broker": read_only_status().__dict__,
     }
+
+
+@app.get("/provider/inspect/{symbol}")
+def provider_inspect(
+    symbol: str,
+    interval: str = "1h",
+    outputsize: int = 10,
+):
+    """Diagnostic-only endpoint for one Twelve Data request.
+
+    This bypasses the application cache and does not run forecasting,
+    signal generation, risk evaluation, or execution.
+    """
+    if interval not in settings.forecast_intervals:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Supported intervals: {settings.forecast_intervals}",
+        )
+    if outputsize < 1 or outputsize > 100:
+        raise HTTPException(status_code=400, detail="outputsize must be between 1 and 100.")
+
+    try:
+        return inspect_time_series(
+            settings.twelve_data_api_key,
+            symbol=normalize_symbol(symbol),
+            interval=interval,
+            outputsize=outputsize,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/market/{symbol}")
