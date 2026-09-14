@@ -23,14 +23,14 @@ class Settings(BaseSettings):
     primary_interval: str = "1h"
     forecast_intervals: list[str] = ["1h", "4h", "1day"]
 
-    # Tiingo FX returns verified 1h historical OHLC. The 4h and 1day layers
-    # are calculated from that 1h source using a canonical FX trading-day
-    # boundary so DST changes do not create artificial daily timestamps.
-    tiingo_history_days: int = 1095
+    # Keep the intraday request bounded for reliable real-time freshness.
+    # Long-horizon research uses the native Tiingo daily endpoint separately.
+    tiingo_intraday_history_days: int = 365
+    tiingo_daily_history_days: int = 1095
     tiingo_cache_ttl_seconds: int = 300
 
-    # Canonical FX trading-day boundary: 17:00 America/New_York.
-    # The timezone is DST-aware through Python's zoneinfo database.
+    # Canonical FX trading-day boundary for session validation/reporting.
+    # Tiingo's documented FX market hours close at 5pm New York time.
     fx_daily_boundary_timezone: str = "America/New_York"
     fx_daily_boundary_hour_local: int = 17
 
