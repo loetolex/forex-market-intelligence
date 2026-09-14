@@ -4,14 +4,17 @@ Research-to-paper-trading backend for the Forex Market Intelligence project.
 
 ## Current status
 
-- Primary market data: Twelve Data
+- Primary market data: Tiingo FX
+- Secondary market data: Twelve Data
 - Macro context: FRED / ECB
 - Research source: existing Colab master notebook
 - Deployment target: Railway
 - Broker candidate: Interactive Brokers
 - Runtime mode: PAPER/DEMO only
 - Live trading: **DISABLED**
-- Order placement: **NOT IMPLEMENTED in this first deployment package**
+- Order placement: **DISABLED** in the current deployment
+- Timeframe source: Tiingo 1H REAL_DATA
+- Derived timeframes: 4H and 1D calculated only from complete closed 1H candles
 
 The application is intentionally fail-closed. Missing data, stale data, invalid data,
 model failure, or risk failure produces `NO TRADE` / `HOLD` rather than an order.
@@ -19,16 +22,23 @@ model failure, or risk failure produces `NO TRADE` / `HOLD` rather than an order
 ## Architecture
 
 ```text
-Twelve Data
+Tiingo FX 1H REAL_DATA
     |
     v
-Market Data Validation
+Closed-Candle Validation
+    |
+    +----> Calculated 4H
+    |
+    +----> Calculated 1D
     |
     v
 Feature Engine
     |
     v
 Forecast Model
+    |
+    v
+Strict Validation / Admission
     |
     v
 Signal Engine
@@ -40,8 +50,11 @@ Risk Engine
 Execution Approval
     |
     v
-IBKR Paper (read-only in this first deployment)
+IBKR Paper / Read-Only
 ```
+
+Twelve Data remains available as a secondary provider for diagnostics and cross-checks.
+A provider disagreement never authorizes trading.
 
 The Colab notebook remains the research/reproducibility environment. The deployable
 application is the runtime environment.
@@ -49,6 +62,10 @@ application is the runtime environment.
 ## Environment variables
 
 Required for market data:
+
+- `TIINGO_API_TOKEN`
+
+Secondary market-data diagnostics:
 
 - `TWELVE_DATA_API_KEY`
 
@@ -74,6 +91,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
+export TIINGO_API_TOKEN="..."
 export TWELVE_DATA_API_KEY="..."
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -84,6 +102,18 @@ Health endpoint:
 GET /health
 ```
 
+Provider diagnostic:
+
+```text
+GET /provider/inspect/EURUSD?interval=1h&outputsize=10
+```
+
+Provider cross-check:
+
+```text
+GET /provider/crosscheck/EURUSD?interval=1h&outputsize=10
+```
+
 Market snapshot:
 
 ```text
@@ -92,7 +122,7 @@ GET /market/EURUSD?interval=1h
 
 ## Railway
 
-Create a Railway service from this repository.
+Use the existing Railway `forex-api` service connected to this repository.
 
 Start command:
 
@@ -104,8 +134,8 @@ Set secrets in Railway Variables. Do not commit credentials.
 
 ## Deployment synchronization
 
-Deployment synchronization marker: existing Railway `forex-api` service only.
-No new service and no environment replacement.
+This repository is synchronized with the existing Railway `forex-api` service only.
+Do not create a second production service for the same API.
 
 ## Important
 
