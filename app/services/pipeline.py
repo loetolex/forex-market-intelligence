@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -22,14 +23,23 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int, interval: str) 
     if df.empty:
         raise RuntimeError("DATA UNAVAILABLE: no market observations remain after validation.")
 
-    latest = pd.to_datetime(df["timestamp"].max(), utc=True, errors="coerce")
-    if pd.isna(latest):
-        raise RuntimeError("DATA UNAVAILABLE: invalid latest timestamp.")
+    if "bar_end_timestamp" in df.columns:
+        latest_close = pd.to_datetime(df["bar_end_timestamp"].max(), utc=True, errors="coerce")
+    else:
+        latest = pd.to_datetime(df["timestamp"].max(), utc=True, errors="coerce")
+        if pd.isna(latest):
+            raise RuntimeError("DATA UNAVAILABLE: invalid latest timestamp.")
+        latest_close = latest + CANDLE_DELTAS.get(interval, pd.Timedelta(0))
 
-    close_time = latest + CANDLE_DELTAS.get(interval, pd.Timedelta(0))
+    if pd.isna(latest_close):
+        raise RuntimeError("DATA UNAVAILABLE: invalid latest candle close timestamp.")
+
     age_minutes = (
-        datetime.now(timezone.utc) - close_time.to_pydatetime()
+        datetime.now(timezone.utc) - latest_close.to_pydatetime()
     ).total_seconds() / 60
+
+    if age_minutes < 0:
+        raise RuntimeError(f"DATA UNAVAILABLE: latest {interval} candle has a future close timestamp.")
 
     if age_minutes > max_stale_minutes:
         raise RuntimeError(
@@ -38,7 +48,7 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int, interval: str) 
 
 
 def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """Admit only closed candles for any provider-supplied interval."""
+    """Admit only fully closed candles for provider-supplied intervals."""
     if interval not in CANDLE_DELTAS:
         return df.copy()
 
@@ -56,7 +66,98 @@ def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
             f"DATA UNAVAILABLE: only {len(closed)} closed {interval} candles remain after completeness validation."
         )
 
+    closed["bar_end_timestamp"] = close_times.loc[closed.index]
     return closed.reset_index(drop=True)
+
+
+def _fx_session_window(session_date: date, boundary_tz: ZoneInfo, boundary_hour: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    start_local = datetime.combine(session_date, time(hour=boundary_hour), tzinfo=boundary_tz)
+    end_local = start_local + timedelta(days=1)
+    return (
+        pd.Timestamp(start_local).tz_convert("UTC"),
+        pd.Timestamp(end_local).tz_convert("UTC"),
+    )
+
+
+def aggregate_fx_daily_from_hourly(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Build canonical FX trading-day candles from verified closed 1H REAL_DATA.
+
+    The canonical FX day is defined by a DST-aware local boundary (default
+    17:00 America/New_York). The expected hourly bar count is calculated from
+    the actual UTC session duration, so DST transition sessions can contain
+    23 or 25 hourly bars without being incorrectly rejected.
+    """
+    if df_1h.empty:
+        raise RuntimeError("DATA UNAVAILABLE: no hourly source data for daily aggregation.")
+    if df_1h["data_status"].ne("REAL_DATA").any():
+        raise RuntimeError("DATA UNAVAILABLE: aggregation requires REAL_DATA hourly observations.")
+
+    boundary_tz = ZoneInfo(settings.fx_daily_boundary_timezone)
+    boundary_hour = int(settings.fx_daily_boundary_hour_local)
+    if not 0 <= boundary_hour <= 23:
+        raise RuntimeError("DATA UNAVAILABLE: invalid FX daily boundary hour configuration.")
+
+    frame = df_1h.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    frame = (
+        frame.dropna(subset=["timestamp"])
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+
+    local_ts = frame["timestamp"].dt.tz_convert(boundary_tz)
+    # Session date changes at the configured local boundary, not at UTC midnight.
+    session_date = (local_ts - pd.Timedelta(hours=boundary_hour)).dt.date
+    frame["session_date"] = session_date
+
+    records: list[dict] = []
+    for session_day, group in frame.groupby("session_date", sort=True):
+        group = group.sort_values("timestamp").reset_index(drop=True)
+        start_utc, end_utc = _fx_session_window(session_day, boundary_tz, boundary_hour)
+        expected_index = pd.date_range(
+            start=start_utc,
+            end=end_utc - pd.Timedelta(hours=1),
+            freq="1h",
+            tz="UTC",
+        )
+        expected_count = len(expected_index)
+
+        timestamps = group["timestamp"].reset_index(drop=True)
+        if len(group) != expected_count:
+            continue
+        if not timestamps.equals(pd.Series(expected_index, name=None)):
+            continue
+
+        record = {
+            "timestamp": start_utc,
+            "bar_end_timestamp": end_utc,
+            "open": float(group.iloc[0]["open"]),
+            "high": float(group["high"].max()),
+            "low": float(group["low"].min()),
+            "close": float(group.iloc[-1]["close"]),
+            "provider": "Tiingo FX",
+            "instrument": str(group.iloc[0]["instrument"]),
+            "timeframe": "1day",
+            "data_status": "REAL_DATA",
+            "source_timeframe": "1h",
+            "calculation_status": "CALCULATED",
+            "source_row_count": expected_count,
+            "fx_daily_boundary": f"{boundary_hour:02d}:00 {settings.fx_daily_boundary_timezone}",
+        }
+        if "volume" in group.columns:
+            volume = pd.to_numeric(group["volume"], errors="coerce").dropna()
+            if not volume.empty:
+                record["volume"] = float(volume.sum())
+        records.append(record)
+
+    daily = pd.DataFrame(records)
+    if daily.empty:
+        raise RuntimeError(
+            "DATA UNAVAILABLE: no complete canonical FX daily candles could be calculated from closed 1H data."
+        )
+
+    return daily.reset_index(drop=True)
 
 
 def aggregate_from_hourly(
@@ -65,7 +166,10 @@ def aggregate_from_hourly(
     target_timeframe: str,
     expected_bars: int,
 ) -> pd.DataFrame:
-    """Aggregate complete UTC candles from verified closed Tiingo 1H REAL_DATA."""
+    """Aggregate complete fixed-duration candles from verified closed 1H data."""
+    if target_timeframe == "1day":
+        return aggregate_fx_daily_from_hourly(df_1h)
+
     if df_1h.empty:
         raise RuntimeError("DATA UNAVAILABLE: no hourly source data for aggregation.")
     if df_1h["data_status"].ne("REAL_DATA").any():
@@ -78,8 +182,8 @@ def aggregate_from_hourly(
         .sort_values("timestamp")
         .drop_duplicates("timestamp")
         .reset_index(drop=True)
+        .set_index("timestamp")
     )
-    frame = frame.set_index("timestamp")
 
     grouped = frame.resample(rule, label="left", closed="left").agg(
         open=("open", "first"),
@@ -94,7 +198,7 @@ def aggregate_from_hourly(
         subset=["open", "high", "low", "close"]
     )
     grouped = grouped.reset_index()
-
+    grouped["bar_end_timestamp"] = grouped["timestamp"] + pd.Timedelta(hours=4)
     grouped["provider"] = "Tiingo FX"
     grouped["instrument"] = df_1h["instrument"].iloc[0]
     grouped["timeframe"] = target_timeframe
@@ -188,7 +292,8 @@ def run_market_cycle(symbol: str) -> dict:
         "daily_aggregation": {
             "status": "CALCULATED" if "1day" in frames else "DATA UNAVAILABLE",
             "source": "Tiingo FX 1H REAL_DATA",
-            "complete_utc_days": int(len(frames["1day"])) if "1day" in frames else 0,
+            "complete_fx_sessions": int(len(frames["1day"])) if "1day" in frames else 0,
+            "boundary": f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}",
         },
         "forecasts": per_tf,
         "combined_forecast": combined,
