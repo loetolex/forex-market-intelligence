@@ -10,6 +10,13 @@ from app.models.multi_timeframe import combine_timeframes, forecast_90d, forecas
 from app.risk.gate import evaluate_signal
 
 
+CANDLE_DELTAS = {
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+    "1day": pd.Timedelta(days=1),
+}
+
+
 def validate_freshness(df: pd.DataFrame, max_stale_minutes: int) -> None:
     latest = pd.to_datetime(df["timestamp"].max(), utc=True, errors="coerce")
     if pd.isna(latest):
@@ -17,6 +24,35 @@ def validate_freshness(df: pd.DataFrame, max_stale_minutes: int) -> None:
     age_minutes = (datetime.now(timezone.utc) - latest.to_pydatetime()).total_seconds() / 60
     if age_minutes > max_stale_minutes:
         raise RuntimeError(f"STALE_DATA: latest market observation is {age_minutes:.1f} minutes old.")
+
+
+def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Admit only candles whose close time has already passed.
+
+    Twelve Data timestamps are treated as candle-open timestamps. This prevents
+    current/incomplete bars and future-dated provider rows from entering the
+    forecasting pipeline.
+    """
+    if interval not in CANDLE_DELTAS:
+        return df.copy()
+
+    now = pd.Timestamp.now(tz="UTC")
+    timestamps = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    close_times = timestamps + CANDLE_DELTAS[interval]
+    mask = timestamps.notna() & (timestamps <= now) & (close_times <= now)
+    closed = df.loc[mask].copy()
+
+    if closed.empty:
+        raise RuntimeError(
+            f"DATA UNAVAILABLE: no closed {interval} candles are available."
+        )
+
+    if len(closed) < 20:
+        raise RuntimeError(
+            f"DATA UNAVAILABLE: only {len(closed)} closed {interval} candles remain after completeness validation."
+        )
+
+    return closed.reset_index(drop=True)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -39,6 +75,7 @@ def run_market_cycle(symbol: str) -> dict:
         )
         if raw["data_status"].ne("REAL_DATA").any():
             raise RuntimeError("DATA UNAVAILABLE: provider provenance is not REAL_DATA.")
+        raw = keep_closed_candles(raw, interval)
         freshness_limit = settings.max_stale_minutes if interval == settings.primary_interval else settings.max_stale_minutes * 8
         validate_freshness(raw, freshness_limit)
         frames[interval] = raw
