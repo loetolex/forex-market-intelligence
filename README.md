@@ -15,6 +15,8 @@ Research-to-paper-trading backend for the Forex Market Intelligence project.
 - Order placement: **DISABLED** in the current deployment
 - Timeframe source: Tiingo 1H REAL_DATA
 - Derived timeframes: 4H and 1D calculated only from complete closed 1H candles
+- Canonical FX daily boundary: **17:00 America/New_York** (DST-aware)
+- Tiingo research history window: **1095 calendar days** by default
 
 The application is intentionally fail-closed. Missing data, stale data, invalid data,
 model failure, or risk failure produces `NO TRADE` / `HOLD` rather than an order.
@@ -29,7 +31,7 @@ Closed-Candle Validation
     |
     +----> Calculated 4H
     |
-    +----> Calculated 1D
+    +----> Calculated 1D (17:00 America/New_York boundary)
     |
     v
 Feature Engine
@@ -56,8 +58,32 @@ IBKR Paper / Read-Only
 Twelve Data remains available as a secondary provider for diagnostics and cross-checks.
 A provider disagreement never authorizes trading.
 
+The 1H source is used to calculate both 4H and 1D candles so all timeframes use the same
+verified clock and candle lineage. DST transition sessions are handled with the canonical
+New York 17:00 boundary instead of assuming every FX day is exactly 24 UTC hours.
+
 The Colab notebook remains the research/reproducibility environment. The deployable
 application is the runtime environment.
+
+## Watchlist
+
+The default portfolio watchlist contains 12 pairs:
+
+- EUR/USD
+- GBP/USD
+- USD/JPY
+- USD/CHF
+- AUD/USD
+- USD/CAD
+- NZD/USD
+- EUR/GBP
+- EUR/JPY
+- GBP/JPY
+- AUD/JPY
+- NZD/JPY
+
+Any individual supported Tiingo FX pair can also be queried through `/market/{symbol}`.
+Unsupported or unavailable provider data fails closed as `DATA UNAVAILABLE`.
 
 ## Environment variables
 
@@ -118,6 +144,12 @@ Market snapshot:
 
 ```text
 GET /market/EURUSD?interval=1h
+```
+
+Portfolio snapshot (12 default pairs):
+
+```text
+GET /portfolio
 ```
 
 ## Railway
