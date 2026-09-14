@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     ibkr_client_id: int = 901
 
     primary_interval: str = "1h"
+    forecast_intervals: list[str] = ["1h", "4h", "1day"]
+    forecast_outputsize: int = 500
     max_stale_minutes: int = 180
 
     model_config = SettingsConfigDict(
