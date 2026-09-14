@@ -160,10 +160,6 @@ def fetch_time_series(
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    # Twelve Data documents timestamps as candle-open timestamps. Intraday
-    # values are requested explicitly in UTC. Daily timestamps are intentionally
-    # retained as the provider's exchange-local date label because timezone is
-    # ignored for 1day bars.
     raw_timestamp = df["timestamp"].astype(str)
     df["timestamp"] = pd.to_datetime(raw_timestamp, utc=True, errors="coerce")
     df["provider_timestamp_local"] = raw_timestamp
@@ -188,3 +184,52 @@ def fetch_time_series(
 
     _put_cached(cache_key, df)
     return df.copy(deep=True)
+
+
+def inspect_time_series(
+    api_key: str,
+    symbol: str = "EUR/USD",
+    interval: str = "1h",
+    outputsize: int = 10,
+) -> dict:
+    """Make one provider request and expose raw response metadata.
+
+    This diagnostic intentionally bypasses the application data cache so the
+    result describes the actual Twelve Data response received for this request.
+    It is not used by forecasting or trading paths.
+    """
+    if not api_key:
+        raise ProviderError("DATA UNAVAILABLE: TWELVE_DATA_API_KEY is not configured.")
+
+    symbol = symbol.upper().replace("_", "/")
+    interval = interval.strip().lower()
+    outputsize = int(outputsize)
+    end_date = _daily_end_date() if interval == "1day" else None
+    request_timestamp = datetime.now(timezone.utc).isoformat()
+
+    payload = _request_time_series(
+        api_key,
+        symbol=symbol,
+        interval=interval,
+        outputsize=outputsize,
+        end_date=end_date,
+    )
+
+    values = payload.get("values") or []
+    meta = payload.get("meta") or {}
+    raw_timestamps = [str(row.get("datetime")) for row in values if row.get("datetime") is not None]
+
+    return {
+        "provider": "Twelve Data",
+        "symbol": symbol,
+        "interval": interval,
+        "returned_row_count": len(values),
+        "first_timestamp": raw_timestamps[0] if raw_timestamps else "DATA UNAVAILABLE",
+        "last_timestamp": raw_timestamps[-1] if raw_timestamps else "DATA UNAVAILABLE",
+        "exchange_timezone": meta.get("exchange_timezone", "DATA UNAVAILABLE"),
+        "provider_status": payload.get("status", "ok"),
+        "request_timestamp_utc": request_timestamp,
+        "request_end_date": end_date,
+        "meta": meta,
+        "data_available": bool(values),
+    }
