@@ -24,9 +24,15 @@ class Settings(BaseSettings):
     forecast_intervals: list[str] = ["1h", "4h", "1day"]
 
     # Tiingo FX returns verified 1h historical OHLC. The 4h and 1day layers
-    # are calculated from that 1h source so the model has a consistent clock.
-    tiingo_history_days: int = 365
+    # are calculated from that 1h source using a canonical FX trading-day
+    # boundary so DST changes do not create artificial daily timestamps.
+    tiingo_history_days: int = 1095
     tiingo_cache_ttl_seconds: int = 300
+
+    # Canonical FX trading-day boundary: 17:00 America/New_York.
+    # The timezone is DST-aware through Python's zoneinfo database.
+    fx_daily_boundary_timezone: str = "America/New_York"
+    fx_daily_boundary_hour_local: int = 17
 
     forecast_outputsize: int = 500
     max_stale_minutes: int = 180
