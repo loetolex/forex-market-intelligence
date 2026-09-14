@@ -102,6 +102,12 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
 Set secrets in Railway Variables. Do not commit credentials.
 
+## Deployment synchronization
+
+This commit is intentionally a no-code deployment trigger so the existing Railway
+`forex-api` service can pull the current `main` branch without creating another service
+or changing its environment/variables.
+
 ## Important
 
 This deployment is not a live trading system.
