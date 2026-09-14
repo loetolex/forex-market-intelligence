@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -13,6 +13,8 @@ from app.risk.gate import evaluate_signal
 
 
 CANDLE_DELTAS = {
+    "15m": pd.Timedelta(minutes=15),
+    "30m": pd.Timedelta(minutes=30),
     "1h": pd.Timedelta(hours=1),
     "4h": pd.Timedelta(hours=4),
 }
@@ -48,8 +50,6 @@ def normalize_native_daily_sessions(df: pd.DataFrame) -> pd.DataFrame:
     frame["bar_end_timestamp"] = frame["timestamp"].map(_daily_session_end_from_label)
 
     now = pd.Timestamp.now(tz="UTC")
-    # A daily provider timestamp is a date label, not the true session close.
-    # Drop any label whose canonical 17:00 New York close has not happened yet.
     frame = frame.loc[frame["bar_end_timestamp"] <= now].copy()
     if frame.empty:
         raise RuntimeError("DATA UNAVAILABLE: no completed Tiingo daily FX sessions are available.")
@@ -65,8 +65,7 @@ def normalize_native_daily_sessions(df: pd.DataFrame) -> pd.DataFrame:
     frame["calculation_status"] = "SOURCE"
     frame["data_status"] = "REAL_DATA"
     frame["fx_daily_boundary"] = (
-        f"{settings.fx_daily_boundary_hour_local:02d}:00 "
-        f"{settings.fx_daily_boundary_timezone}"
+        f"{settings.fx_daily_boundary_hour_local:02d}:00 {settings.fx_daily_boundary_timezone}"
     )
     return frame
 
@@ -126,13 +125,18 @@ def keep_closed_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     return closed.reset_index(drop=True)
 
 
-def aggregate_from_hourly(df_1h: pd.DataFrame, rule: str, target_timeframe: str, expected_bars: int) -> pd.DataFrame:
-    if df_1h.empty:
-        raise RuntimeError("DATA UNAVAILABLE: no hourly source data for aggregation.")
-    if df_1h["data_status"].ne("REAL_DATA").any():
-        raise RuntimeError("DATA UNAVAILABLE: aggregation requires REAL_DATA hourly observations.")
+def aggregate_from_frame(
+    source_frame: pd.DataFrame,
+    rule: str,
+    target_timeframe: str,
+    expected_bars: int,
+) -> pd.DataFrame:
+    if source_frame.empty:
+        raise RuntimeError("DATA UNAVAILABLE: no source data for aggregation.")
+    if source_frame["data_status"].ne("REAL_DATA").any():
+        raise RuntimeError("DATA UNAVAILABLE: aggregation requires REAL_DATA observations.")
 
-    frame = df_1h.copy()
+    frame = source_frame.copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
     frame = (
         frame.dropna(subset=["timestamp"])
@@ -152,12 +156,12 @@ def aggregate_from_hourly(df_1h: pd.DataFrame, rule: str, target_timeframe: str,
     grouped = grouped[grouped["source_row_count"] == expected_bars]
     grouped = grouped.drop(columns=["source_row_count"]).dropna(subset=["open", "high", "low", "close"])
     grouped = grouped.reset_index()
-    grouped["bar_end_timestamp"] = grouped["timestamp"] + pd.Timedelta(hours=4)
+    grouped["bar_end_timestamp"] = grouped["timestamp"] + CANDLE_DELTAS[target_timeframe]
     grouped["provider"] = "Tiingo FX"
-    grouped["instrument"] = df_1h["instrument"].iloc[0]
+    grouped["instrument"] = source_frame["instrument"].iloc[0]
     grouped["timeframe"] = target_timeframe
     grouped["data_status"] = "REAL_DATA"
-    grouped["source_timeframe"] = "1h"
+    grouped["source_timeframe"] = str(source_frame["timeframe"].iloc[0])
     grouped["calculation_status"] = "CALCULATED"
     grouped["source_row_count"] = expected_bars
     return grouped.reset_index(drop=True)
@@ -170,25 +174,70 @@ def normalize_symbol(symbol: str) -> str:
     return symbol
 
 
+def _freshness_limit(interval: str) -> int:
+    return int(settings.freshness_limits_minutes.get(interval, settings.max_stale_minutes))
+
+
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
 
-    hourly_raw = fetch_time_series(
-        settings.tiingo_api_token,
-        symbol=symbol,
-        interval="1h",
-        history_days=settings.tiingo_intraday_history_days,
-        cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
-    )
-    hourly_closed = keep_closed_candles(hourly_raw, "1h")
-    validate_freshness(hourly_closed, settings.max_stale_minutes, "1h")
+    frames: dict[str, pd.DataFrame] = {}
+    per_tf: list[dict] = []
 
-    frames: dict[str, pd.DataFrame] = {"1h": hourly_closed}
-    per_tf: list[dict] = [forecast_timeframe(hourly_closed, symbol, "1h")]
+    # Each operational timeframe is fetched/derived sequentially. This avoids
+    # parallel provider pressure while keeping the five-timeframe stack explicit.
+    if "15m" in settings.forecast_intervals:
+        fifteen = fetch_time_series(
+            settings.tiingo_api_token,
+            symbol=symbol,
+            interval="15m",
+            history_days=settings.tiingo_intraday_history_days,
+            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
+        )
+        fifteen = keep_closed_candles(fifteen, "15m")
+        validate_freshness(fifteen, _freshness_limit("15m"), "15m")
+        frames["15m"] = fifteen
+        per_tf.append(forecast_timeframe(fifteen, symbol, "15m"))
+
+    if "30m" in settings.forecast_intervals:
+        thirty = fetch_time_series(
+            settings.tiingo_api_token,
+            symbol=symbol,
+            interval="30m",
+            history_days=settings.tiingo_intraday_history_days,
+            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
+        )
+        thirty = keep_closed_candles(thirty, "30m")
+        validate_freshness(thirty, _freshness_limit("30m"), "30m")
+        frames["30m"] = thirty
+        per_tf.append(forecast_timeframe(thirty, symbol, "30m"))
+
+    if "1h" in settings.forecast_intervals:
+        hourly = fetch_time_series(
+            settings.tiingo_api_token,
+            symbol=symbol,
+            interval="1h",
+            history_days=settings.tiingo_intraday_history_days,
+            cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
+        )
+        hourly = keep_closed_candles(hourly, "1h")
+        validate_freshness(hourly, _freshness_limit("1h"), "1h")
+        frames["1h"] = hourly
+        per_tf.append(forecast_timeframe(hourly, symbol, "1h"))
 
     if "4h" in settings.forecast_intervals:
-        four_hour = aggregate_from_hourly(hourly_closed, "4h", "4h", expected_bars=4)
-        validate_freshness(four_hour, settings.max_stale_minutes * 8, "4h")
+        hourly_source = frames.get("1h")
+        if hourly_source is None:
+            hourly_source = fetch_time_series(
+                settings.tiingo_api_token,
+                symbol=symbol,
+                interval="1h",
+                history_days=settings.tiingo_intraday_history_days,
+                cache_ttl_seconds=settings.tiingo_cache_ttl_seconds,
+            )
+            hourly_source = keep_closed_candles(hourly_source, "1h")
+        four_hour = aggregate_from_frame(hourly_source, "4h", "4h", expected_bars=4)
+        validate_freshness(four_hour, _freshness_limit("4h"), "4h")
         frames["4h"] = four_hour
         forecast_4h = forecast_timeframe(four_hour, symbol, "4h")
         forecast_4h["calculation_status"] = "CALCULATED"
@@ -205,7 +254,7 @@ def run_market_cycle(symbol: str) -> dict:
         )
         daily = daily.loc[daily["data_status"].eq("REAL_DATA")].copy()
         daily = normalize_native_daily_sessions(daily)
-        validate_freshness(daily, settings.max_stale_minutes * 8, "1day")
+        validate_freshness(daily, _freshness_limit("1day"), "1day")
         frames["1day"] = daily
         daily_forecast = forecast_timeframe(daily, symbol, "1day")
         daily_forecast["calculation_status"] = "SOURCE"
