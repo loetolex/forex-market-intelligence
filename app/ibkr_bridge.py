@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 import threading
@@ -12,7 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from app.execution.ibkr_adapter import get_ibkr_adapter
 from app.paper_performance import init_db, summary as paper_summary, worker_tick, sleep_seconds
 
-app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.2.0")
+app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.3.0")
 
 BRIDGE_TOKEN = os.getenv("IBKR_BRIDGE_TOKEN", "")
 PAPER_MONITOR_ENABLED = os.getenv("PAPER_MONITOR_ENABLED", "true").lower() == "true"
@@ -171,22 +172,33 @@ def historical(
 
 
 @app.get("/historical-batch")
-def historical_batch(
+async def historical_batch(
     symbols: Annotated[list[str], Query()],
     outputsize: int = Query(default=420, ge=1, le=500),
     _: None = Auth,
 ):
+    """Fetch multiple unique FX 15m histories concurrently through one bridge call.
+
+    The prior implementation requested each pair serially. With 12 portfolio pairs
+    that could exceed Cloudflare Quick Tunnel's request timeout even though IBKR
+    itself was healthy. Async ib_async requests fan out over the same IB session and
+    preserve the existing paper/read-only architecture.
+    """
     adapter = get_ibkr_adapter()
-    unique = list(dict.fromkeys(symbols))
+    unique = list(dict.fromkeys(adapter.normalize_symbol(symbol) for symbol in symbols))
     if not unique or len(unique) > 12:
         raise HTTPException(status_code=400, detail="Provide 1 to 12 unique FX symbols.")
-    rows: dict[str, list[dict]] = {}
-    for symbol in unique:
-        normalized = adapter.normalize_symbol(symbol)
-        try:
-            rows[normalized] = adapter.get_historical_15m(normalized, outputsize=outputsize)
-        except Exception:
-            rows[normalized] = []
+
+    try:
+        rows = await asyncio.wait_for(
+            adapter.get_historical_15m_batch_async(unique, outputsize=outputsize),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="IBKR DATA TIMEOUT: 15m batch exceeded 90 seconds.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"IBKR DATA UNAVAILABLE: {exc}") from exc
+
     return {
         "status": "REAL_BROKER_DATA",
         "broker": "INTERACTIVE_BROKERS",
