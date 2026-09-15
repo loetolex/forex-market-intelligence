@@ -24,7 +24,9 @@ from app.paper_trading import (
 app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.4.0")
 
 BRIDGE_TOKEN = os.getenv("IBKR_BRIDGE_TOKEN", "")
-PAPER_MONITOR_ENABLED = os.getenv("PAPER_MONITOR_ENABLED", "true").lower() == "true"
+# The performance monitor is diagnostic only and must not interfere with the
+# controlled broker-order lifecycle. Opt in explicitly when needed.
+PAPER_MONITOR_ENABLED = os.getenv("PAPER_MONITOR_ENABLED", "false").lower() == "true"
 FOREX_API_URL = os.getenv(
     "FOREX_API_URL",
     "https://forex-api-production-f587.up.railway.app",
