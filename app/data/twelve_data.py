@@ -85,75 +85,7 @@ def _provider_interval(interval: str) -> str:
         raise ProviderError(f"DATA UNAVAILABLE: unsupported Twelve Data interval '{interval}'.") from exc
 
 
-def _request_time_series(
-    api_key: str,
-    symbol: str,
-    interval: str,
-    outputsize: int,
-    end_date: str | None,
-) -> dict:
-    retries = max(0, int(settings.twelve_data_max_429_retries))
-    provider_interval = _provider_interval(interval)
-    params = {
-        "symbol": symbol,
-        "interval": provider_interval,
-        "outputsize": outputsize,
-        "order": "asc",
-        "format": "JSON",
-        "apikey": api_key,
-    }
-    if provider_interval != "1day":
-        params["timezone"] = "UTC"
-    if end_date is not None:
-        params["end_date"] = end_date
-
-    for attempt in range(retries + 1):
-        _wait_for_rate_slot()
-        response = httpx.get(
-            f"{BASE_URL}/time_series",
-            params=params,
-            timeout=45,
-        )
-        if response.status_code == 429:
-            if attempt >= retries:
-                raise ProviderError(
-                    "DATA UNAVAILABLE: Twelve Data rate limit reached after retry."
-                )
-            time.sleep(max(1, int(settings.twelve_data_retry_wait_seconds)))
-            continue
-        response.raise_for_status()
-        return response.json()
-
-    raise ProviderError("DATA UNAVAILABLE: Twelve Data request could not be completed.")
-
-
-def fetch_time_series(
-    api_key: str,
-    symbol: str = "EUR/USD",
-    interval: str = "1h",
-    outputsize: int = 500,
-) -> pd.DataFrame:
-    if not api_key:
-        raise ProviderError("DATA UNAVAILABLE: TWELVE_DATA_API_KEY is not configured.")
-
-    symbol = symbol.upper().replace("_", "/")
-    interval = interval.strip().lower()
-    outputsize = int(outputsize)
-    end_date = _daily_end_date() if interval == "1day" else None
-    cache_key = (symbol, interval, outputsize, end_date)
-
-    cached = _get_cached(cache_key)
-    if cached is not None:
-        return cached
-
-    payload = _request_time_series(
-        api_key,
-        symbol=symbol,
-        interval=interval,
-        outputsize=outputsize,
-        end_date=end_date,
-    )
-
+def _frame_from_payload(payload: dict, symbol: str, interval: str) -> pd.DataFrame:
     if payload.get("status") == "error":
         raise ProviderError(
             f"PROVIDER ERROR: {payload.get('message', 'Unknown Twelve Data error')}"
@@ -189,17 +121,183 @@ def fetch_time_series(
     )
 
     if df.empty:
-        raise ProviderError(
-            "DATA UNAVAILABLE: no valid OHLC rows remain after validation."
-        )
+        raise ProviderError("DATA UNAVAILABLE: no valid OHLC rows remain after validation.")
 
     df["provider"] = "Twelve Data"
     df["instrument"] = symbol
     df["timeframe"] = interval
     df["data_status"] = "REAL_DATA"
+    return df
 
+
+def _request_time_series(
+    api_key: str,
+    symbol: str,
+    interval: str,
+    outputsize: int,
+    end_date: str | None,
+) -> dict:
+    retries = max(0, int(settings.twelve_data_max_429_retries))
+    provider_interval = _provider_interval(interval)
+    params = {
+        "symbol": symbol,
+        "interval": provider_interval,
+        "outputsize": outputsize,
+        "order": "asc",
+        "format": "JSON",
+        "apikey": api_key,
+    }
+    if provider_interval != "1day":
+        params["timezone"] = "UTC"
+    if end_date is not None:
+        params["end_date"] = end_date
+
+    for attempt in range(retries + 1):
+        _wait_for_rate_slot()
+        response = httpx.get(f"{BASE_URL}/time_series", params=params, timeout=45)
+        if response.status_code == 429:
+            if attempt >= retries:
+                raise ProviderError("DATA UNAVAILABLE: Twelve Data rate limit reached after retry.")
+            time.sleep(max(1, int(settings.twelve_data_retry_wait_seconds)))
+            continue
+        response.raise_for_status()
+        return response.json()
+
+    raise ProviderError("DATA UNAVAILABLE: Twelve Data request could not be completed.")
+
+
+def _request_batch_time_series(
+    api_key: str,
+    symbols: list[str],
+    interval: str,
+    outputsize: int,
+    end_date: str | None,
+) -> dict[str, dict]:
+    """Fetch one endpoint for multiple symbols in one HTTP request.
+
+    Twelve Data's batch endpoint still consumes credit per symbol, but it avoids
+    serial per-symbol HTTP calls and therefore removes the scanner's artificial
+    multi-minute request choreography.
+    """
+    if not symbols:
+        return {}
+    retries = max(0, int(settings.twelve_data_max_429_retries))
+    provider_interval = _provider_interval(interval)
+    params = {
+        "symbol": ",".join(symbols),
+        "interval": provider_interval,
+        "outputsize": outputsize,
+        "order": "asc",
+        "format": "JSON",
+        "apikey": api_key,
+    }
+    if provider_interval != "1day":
+        params["timezone"] = "UTC"
+    if end_date is not None:
+        params["end_date"] = end_date
+
+    for attempt in range(retries + 1):
+        _wait_for_rate_slot()
+        response = httpx.get(f"{BASE_URL}/time_series", params=params, timeout=60)
+        if response.status_code == 429:
+            if attempt >= retries:
+                raise ProviderError("DATA UNAVAILABLE: Twelve Data batch rate limit reached after retry.")
+            time.sleep(max(1, int(settings.twelve_data_retry_wait_seconds)))
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ProviderError("PROVIDER ERROR: Twelve Data batch returned an invalid payload.")
+        # A single-symbol call returns the normal {status, values, meta} shape.
+        # A multi-symbol batch returns a mapping keyed by symbol.
+        if "values" in payload or payload.get("status") == "error":
+            if len(symbols) == 1:
+                return {symbols[0]: payload}
+            raise ProviderError(
+                f"PROVIDER ERROR: Twelve Data returned a non-batch response for {len(symbols)} symbols."
+            )
+        return {str(key).upper().replace("_", "/"): value for key, value in payload.items() if isinstance(value, dict)}
+
+    raise ProviderError("DATA UNAVAILABLE: Twelve Data batch request could not be completed.")
+
+
+def fetch_time_series(
+    api_key: str,
+    symbol: str = "EUR/USD",
+    interval: str = "1h",
+    outputsize: int = 500,
+) -> pd.DataFrame:
+    if not api_key:
+        raise ProviderError("DATA UNAVAILABLE: TWELVE_DATA_API_KEY is not configured.")
+
+    symbol = symbol.upper().replace("_", "/")
+    interval = interval.strip().lower()
+    outputsize = int(outputsize)
+    end_date = _daily_end_date() if interval == "1day" else None
+    cache_key = (symbol, interval, outputsize, end_date)
+
+    cached = _get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = _request_time_series(api_key, symbol, interval, outputsize, end_date)
+    df = _frame_from_payload(payload, symbol, interval)
     _put_cached(cache_key, df)
     return df.copy(deep=True)
+
+
+def fetch_time_series_batch(
+    api_key: str,
+    symbols: list[str],
+    interval: str = "15m",
+    outputsize: int = 500,
+) -> dict[str, pd.DataFrame]:
+    """Fetch a common interval for multiple symbols with minimal HTTP calls."""
+    if not api_key:
+        raise ProviderError("DATA UNAVAILABLE: TWELVE_DATA_API_KEY is not configured.")
+    interval = interval.strip().lower()
+    outputsize = int(outputsize)
+    normalized = []
+    for raw in symbols:
+        symbol = str(raw).upper().replace("_", "/")
+        if symbol not in normalized:
+            normalized.append(symbol)
+    if not normalized:
+        return {}
+
+    end_date = _daily_end_date() if interval == "1day" else None
+    results: dict[str, pd.DataFrame] = {}
+    missing: list[str] = []
+    for symbol in normalized:
+        key = (symbol, interval, outputsize, end_date)
+        cached = _get_cached(key)
+        if cached is not None:
+            results[symbol] = cached
+        else:
+            missing.append(symbol)
+
+    # Keep batches below the configured request-credit/minute ceiling so a
+    # twelve-pair scan is at most two HTTP requests on the default configuration.
+    batch_size = max(1, int(settings.twelve_data_requests_per_minute) - 1)
+    for start in range(0, len(missing), batch_size):
+        chunk = missing[start:start + batch_size]
+        payloads = _request_batch_time_series(
+            api_key,
+            chunk,
+            interval,
+            outputsize,
+            end_date,
+        )
+        for symbol in chunk:
+            payload = payloads.get(symbol) or payloads.get(symbol.replace("/", ""))
+            if payload is None:
+                raise ProviderError(f"DATA UNAVAILABLE: Twelve Data omitted {symbol} from batch response.")
+            frame = _frame_from_payload(payload, symbol, interval)
+            key = (symbol, interval, outputsize, end_date)
+            _put_cached(key, frame)
+            results[symbol] = frame.copy(deep=True)
+
+    return results
 
 
 def inspect_time_series(
