@@ -12,8 +12,16 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from app.execution.ibkr_adapter import get_ibkr_adapter
 from app.paper_performance import init_db, summary as paper_summary, worker_tick, sleep_seconds
+from app.paper_trading import (
+    close_controlled_test,
+    configuration_status,
+    controlled_test_preview,
+    order_status as paper_order_status,
+    place_controlled_test,
+    start_auto_trader,
+)
 
-app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.3.0")
+app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.4.0")
 
 BRIDGE_TOKEN = os.getenv("IBKR_BRIDGE_TOKEN", "")
 PAPER_MONITOR_ENABLED = os.getenv("PAPER_MONITOR_ENABLED", "true").lower() == "true"
@@ -106,6 +114,7 @@ def startup() -> None:
             daemon=True,
         )
         thread.start()
+    start_auto_trader()
 
 
 @app.get("/health")
@@ -117,6 +126,7 @@ def health(_: None = Auth):
         "broker": "INTERACTIVE_BROKERS",
         "connection": adapter.connection_status().__dict__,
         "paper_monitor_enabled": PAPER_MONITOR_ENABLED,
+        "paper_trading": configuration_status(),
         "paper_performance": {
             "status": "CALCULATED",
             "settled_forecasts": perf["settled_forecasts"],
@@ -177,13 +187,7 @@ async def historical_batch(
     outputsize: int = Query(default=420, ge=1, le=500),
     _: None = Auth,
 ):
-    """Fetch multiple unique FX 15m histories concurrently through one bridge call.
-
-    The prior implementation requested each pair serially. With 12 portfolio pairs
-    that could exceed Cloudflare Quick Tunnel's request timeout even though IBKR
-    itself was healthy. Async ib_async requests fan out over the same IB session and
-    preserve the existing paper/read-only architecture.
-    """
+    """Fetch multiple unique FX 15m histories concurrently through one bridge call."""
     adapter = get_ibkr_adapter()
     unique = list(dict.fromkeys(adapter.normalize_symbol(symbol) for symbol in symbols))
     if not unique or len(unique) > 12:
@@ -209,13 +213,11 @@ async def historical_batch(
 
 @app.get("/paper/performance")
 def paper_performance(_: None = Auth):
-    """Read-only paper-performance ledger and settled model outcomes."""
     return paper_summary()
 
 
 @app.post("/paper/collect")
 def paper_collect(_: None = Auth):
-    """Trigger one paper-performance collection cycle; never places orders."""
     try:
         counts = _collect_one_cycle()
         return {
@@ -228,7 +230,40 @@ def paper_collect(_: None = Auth):
         raise HTTPException(status_code=503, detail=f"PAPER MONITOR ERROR: {exc}") from exc
 
 
+@app.get("/paper/order-config")
+def paper_order_config(_: None = Auth):
+    return configuration_status()
+
+
+@app.post("/paper/test-order/preview")
+def paper_test_order_preview(_: None = Auth):
+    try:
+        return controlled_test_preview()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/paper/test-order")
+def paper_test_order(_: None = Auth):
+    try:
+        return place_controlled_test()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/paper/test-order/status")
+def paper_test_order_status(_: None = Auth):
+    return paper_order_status()
+
+
+@app.post("/paper/test-order/close")
+def paper_test_order_close(_: None = Auth):
+    try:
+        return close_controlled_test()
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/orders")
 def orders(_: None = Auth):
-    # Read-only phase: intentionally do not expose order placement.
-    return {"status": "LOCKED", "orders": [], "execution_authorized": False}
+    return {"status": "PAPER_ONLY", "order_config": configuration_status(), "execution_authorized": False}
