@@ -206,23 +206,63 @@ class IBKRAdapter:
         }
 
     def get_quote(self, symbol: str) -> dict[str, Any]:
+        """Fetch a bounded-time IBKR quote without allowing snapshot hangs.
+
+        ``reqTickers`` can wait on a snapshot-completion event that may never
+        arrive in some paper/demo market-data configurations. We instead use a
+        short-lived streaming subscription, wait a few seconds for a finite
+        value, then explicitly cancel it. A delayed-data retry is attempted if
+        live data is unavailable.
+        """
         ib = self._connected_ib()
         contract = self._qualify_forex(symbol)
-        ticker = ib.reqTickers(contract)[0]
-        market_price = _finite_float(ticker.marketPrice())
-        return {
-            "status": "REAL_BROKER_DATA",
-            "broker": "INTERACTIVE_BROKERS",
-            "symbol": self.normalize_symbol(symbol),
-            "timestamp": ticker.time.isoformat() if ticker.time else None,
-            "bid": _finite_float(ticker.bid),
-            "ask": _finite_float(ticker.ask),
-            "last": _finite_float(ticker.last),
-            "close": _finite_float(ticker.close),
-            "market_price": market_price,
-            "market_data_type": int(ticker.marketDataType) if ticker.marketDataType is not None else None,
-            "data_note": "REAL_BROKER_DATA; null means IBKR did not provide a finite value for that field.",
-        }
+        normalized = self.normalize_symbol(symbol)
+        last_error: str | None = None
+
+        for market_data_type, data_label in ((1, "LIVE"), (3, "DELAYED")):
+            ticker = None
+            try:
+                ib.reqMarketDataType(market_data_type)
+                ticker = ib.reqMktData(
+                    contract,
+                    genericTickList="",
+                    snapshot=False,
+                    regulatorySnapshot=False,
+                )
+                # ib.sleep() yields to ib_async's event loop so the streaming
+                # ticker can be populated without blocking the connection.
+                for _ in range(10):
+                    ib.sleep(0.5)
+                    bid = _finite_float(ticker.bid)
+                    ask = _finite_float(ticker.ask)
+                    last = _finite_float(ticker.last)
+                    close = _finite_float(ticker.close)
+                    market_price = _finite_float(ticker.marketPrice())
+                    if any(v is not None for v in (bid, ask, last, market_price)):
+                        return {
+                            "status": "REAL_BROKER_DATA",
+                            "broker": "INTERACTIVE_BROKERS",
+                            "symbol": normalized,
+                            "timestamp": ticker.time.isoformat() if ticker.time else None,
+                            "bid": bid,
+                            "ask": ask,
+                            "last": last,
+                            "close": close,
+                            "market_price": market_price,
+                            "market_data_type": market_data_type,
+                            "data_note": f"REAL_BROKER_DATA; market_data_type={data_label}.",
+                        }
+                last_error = f"No finite quote values returned for {normalized} using {data_label} data."
+            except Exception as exc:
+                last_error = str(exc)
+            finally:
+                if ticker is not None:
+                    try:
+                        ib.cancelMktData(contract)
+                    except Exception:
+                        pass
+
+        raise RuntimeError(f"BROKER DATA UNAVAILABLE: {last_error or 'IBKR returned no quote data.'}")
 
     @staticmethod
     def _serialize_bars(symbol: str, bars: Any, outputsize: int) -> list[dict[str, Any]]:
