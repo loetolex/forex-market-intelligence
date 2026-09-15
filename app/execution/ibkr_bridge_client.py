@@ -48,6 +48,34 @@ def get_historical_15m(symbol: str, outputsize: int = 420) -> list[dict[str, Any
         raise IBKRBridgeUnavailable(f"DATA UNAVAILABLE: IBKR bridge request failed: {exc}") from exc
 
 
+def get_historical_15m_batch(symbols: list[str], outputsize: int = 420) -> dict[str, list[dict[str, Any]]]:
+    """Fetch 15m history for the portfolio through one authenticated bridge call."""
+    unique = list(dict.fromkeys(str(s).upper().replace("_", "/") for s in symbols))
+    if not unique or len(unique) > 12:
+        raise IBKRBridgeUnavailable("BROKER ERROR: bridge batch supports 1 to 12 symbols.")
+    try:
+        response = httpx.get(
+            f"{_base_url()}/historical-batch",
+            params=[("symbols", symbol) for symbol in unique] + [("outputsize", int(outputsize))],
+            headers=_headers(),
+            timeout=max(float(settings.ibkr_bridge_timeout_seconds), 30.0),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("rows")
+        if not isinstance(rows, dict):
+            raise IBKRBridgeUnavailable("DATA UNAVAILABLE: IBKR bridge returned invalid batch history.")
+        result: dict[str, list[dict[str, Any]]] = {}
+        for symbol in unique:
+            symbol_rows = rows.get(symbol) or rows.get(symbol.replace("/", ""))
+            if not isinstance(symbol_rows, list) or not symbol_rows:
+                raise IBKRBridgeUnavailable(f"DATA UNAVAILABLE: IBKR bridge returned no 15m bars for {symbol}.")
+            result[symbol] = symbol_rows
+        return result
+    except (httpx.HTTPError, ValueError) as exc:
+        raise IBKRBridgeUnavailable(f"DATA UNAVAILABLE: IBKR bridge batch request failed: {exc}") from exc
+
+
 def get_status() -> dict[str, Any]:
     try:
         response = httpx.get(
