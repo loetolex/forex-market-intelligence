@@ -20,6 +20,8 @@ ORDER_CLIENT_ID = int(os.getenv("IBKR_ORDER_CLIENT_ID", "1902"))
 TEST_QUANTITY = float(os.getenv("PAPER_TEST_QUANTITY", "20000"))
 AUTO_QUANTITY = float(os.getenv("PAPER_AUTO_QUANTITY", "20000"))
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("PAPER_AUTO_INTERVAL_SECONDS", "900")))
+PORTFOLIO_REFRESH_TIMEOUT_SECONDS = max(10, int(os.getenv("PAPER_PORTFOLIO_REFRESH_TIMEOUT_SECONDS", "90")))
+PORTFOLIO_REFRESH_POLL_SECONDS = max(1, float(os.getenv("PAPER_PORTFOLIO_REFRESH_POLL_SECONDS", "2")))
 FOREX_API_URL = os.getenv(
     "FOREX_API_URL", "https://forex-api-production-f587.up.railway.app"
 ).rstrip("/")
@@ -221,15 +223,76 @@ def _validate_signal(signal: dict[str, Any]) -> tuple[str, str]:
     return candidate, symbol
 
 
-def _fetch_eurusd_signal() -> dict[str, Any]:
+def _portfolio_results() -> dict[str, Any]:
     response = httpx.get(f"{FOREX_API_URL}/portfolio/results", timeout=25.0)
     response.raise_for_status()
-    payload = response.json()
+    return response.json()
+
+
+def _find_eurusd_result(payload: dict[str, Any]) -> dict[str, Any] | None:
     results = payload.get("results") or []
     for result in results:
         if str(result.get("instrument") or "").upper() == "EUR/USD":
             return result
-    raise RuntimeError("PAPER TEST BLOCKED: EUR/USD is not present in current portfolio results.")
+    return None
+
+
+def _fetch_eurusd_signal() -> dict[str, Any]:
+    """Return the current EUR/USD portfolio result, refreshing the portfolio if needed.
+
+    The portfolio scanner owns signal generation. This function never constructs or
+    substitutes a signal. If EUR/USD is absent from the current in-memory snapshot,
+    it explicitly requests the scanner's existing refresh endpoint, then waits for
+    that same scanner instance to finish before reading the result.
+    """
+    try:
+        result = _find_eurusd_result(_portfolio_results())
+        if result is not None:
+            return result
+    except Exception as exc:
+        initial_error = str(exc)
+    else:
+        initial_error = "EUR/USD is not present in the current portfolio snapshot."
+
+    try:
+        refresh_response = httpx.get(
+            f"{FOREX_API_URL}/portfolio?refresh=true",
+            timeout=25.0,
+        )
+        refresh_response.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"DATA UNAVAILABLE: unable to start portfolio refresh: {exc}") from exc
+
+    deadline = time.monotonic() + PORTFOLIO_REFRESH_TIMEOUT_SECONDS
+    last_status = "UNKNOWN"
+    while time.monotonic() < deadline:
+        try:
+            status_response = httpx.get(f"{FOREX_API_URL}/portfolio/status", timeout=10.0)
+            status_response.raise_for_status()
+            status_payload = status_response.json()
+            last_status = str(status_payload.get("status") or "UNKNOWN").upper()
+        except Exception as exc:
+            raise RuntimeError(f"DATA UNAVAILABLE: portfolio status could not be read: {exc}") from exc
+
+        if last_status == "COMPLETE":
+            try:
+                result = _find_eurusd_result(_portfolio_results())
+            except Exception as exc:
+                raise RuntimeError(f"DATA UNAVAILABLE: completed portfolio results could not be read: {exc}") from exc
+            if result is not None:
+                return result
+            raise RuntimeError("DATA UNAVAILABLE: portfolio scan completed without a EUR/USD result.")
+
+        if last_status in {"FAILED", "ERROR"}:
+            error_text = status_payload.get("last_error") or "portfolio scanner reported failure"
+            raise RuntimeError(f"DATA UNAVAILABLE: portfolio scan failed: {error_text}")
+
+        time.sleep(PORTFOLIO_REFRESH_POLL_SECONDS)
+
+    raise RuntimeError(
+        "DATA UNAVAILABLE: portfolio refresh timed out "
+        f"after {PORTFOLIO_REFRESH_TIMEOUT_SECONDS}s (last_status={last_status}, initial={initial_error})."
+    )
 
 
 def _current_open() -> bool:
@@ -396,13 +459,11 @@ def _auto_tick() -> None:
     signal = _select_auto_signal()
     if signal is None:
         return
-    # Reuse the same strict model gates and paper-only order path.
     decision = str(signal.get("decision") or "NO TRADE").upper()
     hierarchy = signal.get("hierarchical_forecast") or {}
     edge = float(hierarchy.get("hierarchy_edge_percentage_points") or 0.0)
     if decision not in {"LONG", "SHORT"} or not hierarchy.get("entry_trigger") or edge < 10.0:
         return
-    # Automatic trading is deliberately separated from the one-shot EUR/USD test.
     symbol = str(signal.get("instrument") or "").upper()
     normalized, contract = _qualify(symbol)
     ibi = _library()
@@ -457,6 +518,8 @@ def configuration_status() -> dict[str, Any]:
         "test_quantity": TEST_QUANTITY,
         "auto_quantity": AUTO_QUANTITY,
         "auto_interval_seconds": AUTO_INTERVAL_SECONDS,
+        "portfolio_refresh_timeout_seconds": PORTFOLIO_REFRESH_TIMEOUT_SECONDS,
+        "portfolio_refresh_poll_seconds": PORTFOLIO_REFRESH_POLL_SECONDS,
         "live_trading_enabled": bool(settings.live_trading_enabled),
         "trading_mode": settings.trading_mode,
         "paper_only": True,
