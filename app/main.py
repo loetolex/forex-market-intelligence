@@ -7,6 +7,7 @@ from app.backtests.walk_forward import run_walk_forward_backtest
 from app.config import settings
 from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series, inspect_time_series as inspect_tiingo_time_series
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
+from app.execution.ibkr_bridge_client import IBKRBridgeUnavailable, get_status as get_ibkr_bridge_status
 from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
 from app.services.portfolio_scanner import (
@@ -218,6 +219,46 @@ def portfolio_ranking():
 def portfolio_candidates():
     """Read selected deep-analysis candidates without initiating a scan."""
     return get_portfolio_candidates()
+
+
+@app.get("/ibkr/bridge-status")
+def ibkr_bridge_status():
+    """Safe Railway-side connectivity diagnostic for the local IBKR bridge.
+
+    Returns only non-secret bridge/broker state. Credentials, URLs, and tokens
+    are never returned, and this endpoint cannot place or preview an order.
+    """
+    if not settings.ibkr_bridge_url:
+        return {
+            "status": "DATA UNAVAILABLE",
+            "bridge_reachable": False,
+            "broker_connected": False,
+            "reason": "IBKR_BRIDGE_URL is not configured.",
+            "execution_locked": True,
+        }
+    try:
+        payload = get_ibkr_bridge_status()
+        connection = payload.get("connection") or {}
+        return {
+            "status": "CALCULATED",
+            "bridge_reachable": True,
+            "broker_connected": bool(connection.get("connected")),
+            "broker": payload.get("broker", "INTERACTIVE_BROKERS"),
+            "account_present": bool(connection.get("account")),
+            "mode": connection.get("trading_mode", settings.trading_mode),
+            "read_only": bool(connection.get("readonly", True)),
+            "live_trading_enabled": bool(connection.get("live_trading_enabled", False)),
+            "order_placement_enabled": bool(connection.get("order_placement_enabled", False)),
+            "execution_locked": True,
+        }
+    except IBKRBridgeUnavailable as exc:
+        return {
+            "status": "BROKER UNAVAILABLE",
+            "bridge_reachable": False,
+            "broker_connected": False,
+            "reason": str(exc),
+            "execution_locked": True,
+        }
 
 
 @app.get("/backtest/{symbol}")
