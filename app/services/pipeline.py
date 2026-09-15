@@ -236,6 +236,17 @@ def _run_shadow_learning(symbol: str, hierarchical: dict, frame_15m: pd.DataFram
         )
 
 
+def get_shadow_learning_status() -> dict:
+    """Return read-only status for the shared shadow RL learner.
+
+    This accessor does not fetch market data, create a learning experience,
+    change policy state, or authorize execution. It only reports the current
+    learner state so the diagnostic endpoint can be used safely.
+    """
+    with _RL_LOCK:
+        return _RL_LEARNER.status()
+
+
 def run_market_cycle(symbol: str) -> dict:
     symbol = normalize_symbol(symbol)
 
