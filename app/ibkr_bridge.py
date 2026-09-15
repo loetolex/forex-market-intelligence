@@ -110,12 +110,14 @@ def paper_collect(_: None = Auth):
 def paper_order_config(_: None = Auth): return configuration_status()
 
 @app.post("/paper/test-order/preview")
-def paper_test_order_preview(request: TestOrderRequest, _: None = Auth):
+def paper_test_order_preview(request: TestOrderRequest | None = None, _: None = Auth):
+    request = request or TestOrderRequest()
     try: return controlled_test_preview(symbol=request.symbol, timeframe=request.timeframe)
     except Exception as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 @app.post("/paper/test-order")
-def paper_test_order(request: TestOrderRequest, _: None = Auth):
+def paper_test_order(request: TestOrderRequest | None = None, _: None = Auth):
+    request = request or TestOrderRequest()
     try: return place_controlled_test(symbol=request.symbol, timeframe=request.timeframe)
     except Exception as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
