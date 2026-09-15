@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -88,6 +86,25 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _latest_close(history: list[dict[str, Any]]) -> float | None:
+    valid: list[tuple[datetime, float]] = []
+    for bar in history:
+        price = _safe_float(bar.get("close"))
+        if price is None or price <= 0:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(bar.get("timestamp")).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            valid.append((ts.astimezone(timezone.utc), price))
+        except Exception:
+            valid.append((datetime.min.replace(tzinfo=timezone.utc), price))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: item[0])
+    return valid[-1][1]
+
+
 def record_forecast(result: dict[str, Any], quote: dict[str, Any] | None = None) -> str | None:
     symbol = str(result.get("instrument") or "").upper()
     hierarchy = result.get("hierarchical_forecast") or {}
@@ -110,7 +127,6 @@ def record_forecast(result: dict[str, Any], quote: dict[str, Any] | None = None)
             if bid is not None and ask is not None:
                 entry_price = (bid + ask) / 2.0
 
-    dedupe_key = f"{symbol}|{prediction_timestamp}|{result.get('scanner_model','') }"
     forecast_id = str(uuid4())
     with _connect() as conn:
         exists = conn.execute(
@@ -315,9 +331,32 @@ def worker_tick(
     recorded = 0
     results = fetch_results()
     for result in results:
+        symbol = str(result.get("instrument") or "").strip()
         try:
-            quote = get_quote(str(result.get("instrument")))
-            if record_forecast(result, quote):
+            # Quotes are useful when IBKR provides a finite snapshot. They are not
+            # required for paper evaluation: if quote data is unavailable, use the
+            # latest completed 15m IBKR bar as the frozen entry price. This keeps the
+            # evaluation on REAL_BROKER_DATA and avoids coupling the model ledger to
+            # a potentially slow snapshot endpoint.
+            try:
+                quote = get_quote(symbol)
+            except Exception:
+                quote = None
+
+            if quote and _safe_float(quote.get("market_price")) is not None:
+                record = record_forecast(result, quote)
+            else:
+                history = get_history(symbol, 20)
+                entry_price = _latest_close(history)
+                if entry_price is None:
+                    continue
+                record = record_forecast(
+                    result,
+                    {
+                        "market_price": entry_price,
+                    },
+                )
+            if record:
                 recorded += 1
         except Exception:
             continue
