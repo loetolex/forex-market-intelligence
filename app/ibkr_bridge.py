@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import hmac
 import os
-from typing import Annotated
+import threading
+import time
+from typing import Annotated, Any
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from app.execution.ibkr_adapter import get_ibkr_adapter
+from app.paper_performance import init_db, summary as paper_summary, worker_tick, sleep_seconds
 
-app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.1.0")
+app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.2.0")
 
 BRIDGE_TOKEN = os.getenv("IBKR_BRIDGE_TOKEN", "")
+PAPER_MONITOR_ENABLED = os.getenv("PAPER_MONITOR_ENABLED", "true").lower() == "true"
+FOREX_API_URL = os.getenv(
+    "FOREX_API_URL",
+    "https://forex-api-production-f587.up.railway.app",
+).rstrip("/")
 
 
 def _authorize(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -24,10 +33,95 @@ def _authorize(authorization: Annotated[str | None, Header()] = None) -> None:
 Auth = Depends(_authorize)
 
 
+def _fetch_railway_results() -> list[dict[str, Any]]:
+    response = httpx.get(f"{FOREX_API_URL}/portfolio/results", timeout=20.0)
+    response.raise_for_status()
+    payload = response.json()
+    rows = payload.get("results", [])
+    return rows if isinstance(rows, list) else []
+
+
+def _refresh_railway_portfolio() -> None:
+    # Diagnostic/paper monitoring only. This starts the existing scanner; it does
+    # not and cannot authorize an order.
+    response = httpx.get(
+        f"{FOREX_API_URL}/portfolio",
+        params={"refresh": "true"},
+        timeout=20.0,
+    )
+    response.raise_for_status()
+
+
+def _wait_for_scan_results(timeout_seconds: float = 300.0) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = httpx.get(f"{FOREX_API_URL}/portfolio/status", timeout=20.0)
+        response.raise_for_status()
+        status = response.json()
+        state = str(status.get("status") or "").upper()
+        completed = int(status.get("pairs_completed") or 0)
+        total = int(status.get("pairs_total") or 0)
+        if state == "COMPLETE" or (total > 0 and completed >= total):
+            return _fetch_railway_results()
+        if state in {"FAILED", "ERROR"}:
+            return []
+        time.sleep(5)
+    return []
+
+
+def _collect_one_cycle() -> dict[str, int]:
+    _refresh_railway_portfolio()
+    rows = _wait_for_scan_results()
+    if not rows:
+        return {"recorded": 0, "settled": 0}
+
+    adapter = get_ibkr_adapter()
+    return worker_tick(
+        fetch_results=lambda rows=rows: rows,
+        get_quote=lambda symbol: adapter.get_quote(symbol),
+        get_history=lambda symbol, size: adapter.get_historical_15m(symbol, outputsize=size),
+    )
+
+
+def _monitor_loop() -> None:
+    init_db()
+    while True:
+        try:
+            _collect_one_cycle()
+        except Exception:
+            # Monitoring failure must never interrupt the broker bridge or create
+            # an order. The next scheduled tick retries.
+            pass
+        time.sleep(sleep_seconds())
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+    if PAPER_MONITOR_ENABLED:
+        thread = threading.Thread(
+            target=_monitor_loop,
+            name="paper-performance-monitor",
+            daemon=True,
+        )
+        thread.start()
+
+
 @app.get("/health")
 def health(_: None = Auth):
     adapter = get_ibkr_adapter()
-    return {"status": "ok", "broker": "INTERACTIVE_BROKERS", "connection": adapter.connection_status().__dict__}
+    perf = paper_summary()
+    return {
+        "status": "ok",
+        "broker": "INTERACTIVE_BROKERS",
+        "connection": adapter.connection_status().__dict__,
+        "paper_monitor_enabled": PAPER_MONITOR_ENABLED,
+        "paper_performance": {
+            "status": "CALCULATED",
+            "settled_forecasts": perf["settled_forecasts"],
+            "pending_forecasts": perf["pending_forecasts"],
+        },
+    }
 
 
 @app.post("/connect")
@@ -91,7 +185,7 @@ def historical_batch(
         normalized = adapter.normalize_symbol(symbol)
         try:
             rows[normalized] = adapter.get_historical_15m(normalized, outputsize=outputsize)
-        except Exception as exc:
+        except Exception:
             rows[normalized] = []
     return {
         "status": "REAL_BROKER_DATA",
@@ -99,6 +193,27 @@ def historical_batch(
         "timeframe": "15m",
         "rows": rows,
     }
+
+
+@app.get("/paper/performance")
+def paper_performance(_: None = Auth):
+    """Read-only paper-performance ledger and settled model outcomes."""
+    return paper_summary()
+
+
+@app.post("/paper/collect")
+def paper_collect(_: None = Auth):
+    """Trigger one paper-performance collection cycle; never places orders."""
+    try:
+        counts = _collect_one_cycle()
+        return {
+            "status": "CALCULATED",
+            "collection": counts,
+            "performance": paper_summary(),
+            "execution_authorized": False,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"PAPER MONITOR ERROR: {exc}") from exc
 
 
 @app.get("/orders")
