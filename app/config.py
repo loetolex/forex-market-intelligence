@@ -15,10 +15,18 @@ class Settings(BaseSettings):
     trading_mode: str = "PAPER"
     live_trading_enabled: bool = False
     order_placement_enabled: bool = False
+    # Separate gate for a future single controlled IBKR paper-order test.
+    # Must remain false until connectivity, quote, contract, risk and preview tests pass.
+    paper_order_placement_enabled: bool = False
 
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 7497
     ibkr_client_id: int = 901
+    # Optional authenticated local-to-Railway bridge. Leave empty until a secure
+    # private network/tunnel is configured; Railway must never target 127.0.0.1.
+    ibkr_bridge_url: str = ""
+    ibkr_bridge_token: str = ""
+    ibkr_bridge_timeout_seconds: float = 10.0
 
     primary_interval: str = "15m"
     # Operational multi-timeframe stack: 15m / 30m / 1h / 4h / 1day.
