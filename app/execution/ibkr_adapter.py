@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from threading import RLock
 from typing import Any
 
@@ -19,6 +20,17 @@ class BrokerConnection:
     live_trading_enabled: bool
     order_placement_enabled: bool
     status: str
+
+
+def _finite_float(value: Any) -> float | None:
+    """Convert broker numeric values to JSON-safe finite floats."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 class IBKRAdapter:
@@ -156,8 +168,8 @@ class IBKRAdapter:
                     "symbol": p.contract.symbol,
                     "currency": p.contract.currency,
                     "sec_type": p.contract.secType,
-                    "position": float(p.position),
-                    "average_cost": float(p.avgCost),
+                    "position": _finite_float(p.position) or 0.0,
+                    "average_cost": _finite_float(p.avgCost) or 0.0,
                     "con_id": int(p.contract.conId),
                 }
                 for p in positions
@@ -184,10 +196,10 @@ class IBKRAdapter:
                 "sec_type": contract.secType,
             },
             "constraints": {
-                "min_size": float(detail.minSize or 0.0),
-                "size_increment": float(detail.sizeIncrement or 0.0),
-                "suggested_size_increment": float(detail.suggestedSizeIncrement or 0.0),
-                "min_tick": float(detail.minTick or 0.0),
+                "min_size": _finite_float(detail.minSize) or 0.0,
+                "size_increment": _finite_float(detail.sizeIncrement) or 0.0,
+                "suggested_size_increment": _finite_float(detail.suggestedSizeIncrement) or 0.0,
+                "min_tick": _finite_float(detail.minTick) or 0.0,
                 "order_types": detail.orderTypes,
             },
         }
@@ -196,17 +208,19 @@ class IBKRAdapter:
         ib = self._connected_ib()
         contract = self._qualify_forex(symbol)
         ticker = ib.reqTickers(contract)[0]
+        market_price = _finite_float(ticker.marketPrice())
         return {
             "status": "REAL_BROKER_DATA",
             "broker": "INTERACTIVE_BROKERS",
             "symbol": self.normalize_symbol(symbol),
             "timestamp": ticker.time.isoformat() if ticker.time else None,
-            "bid": None if ticker.bid is None else float(ticker.bid),
-            "ask": None if ticker.ask is None else float(ticker.ask),
-            "last": None if ticker.last is None else float(ticker.last),
-            "close": None if ticker.close is None else float(ticker.close),
-            "market_price": None if ticker.marketPrice() is None else float(ticker.marketPrice()),
-            "market_data_type": ticker.marketDataType,
+            "bid": _finite_float(ticker.bid),
+            "ask": _finite_float(ticker.ask),
+            "last": _finite_float(ticker.last),
+            "close": _finite_float(ticker.close),
+            "market_price": market_price,
+            "market_data_type": int(ticker.marketDataType) if ticker.marketDataType is not None else None,
+            "data_note": "REAL_BROKER_DATA; null means IBKR did not provide a finite value for that field.",
         }
 
     def get_historical_15m(self, symbol: str, outputsize: int = 420) -> list[dict[str, Any]]:
@@ -226,11 +240,11 @@ class IBKRAdapter:
         return [
             {
                 "timestamp": bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date),
-                "open": float(bar.open),
-                "high": float(bar.high),
-                "low": float(bar.low),
-                "close": float(bar.close),
-                "volume": float(bar.volume) if bar.volume is not None else None,
+                "open": _finite_float(bar.open),
+                "high": _finite_float(bar.high),
+                "low": _finite_float(bar.low),
+                "close": _finite_float(bar.close),
+                "volume": _finite_float(bar.volume),
                 "provider": "IBKR",
                 "instrument": self.normalize_symbol(symbol),
                 "timeframe": "15m",
@@ -295,8 +309,8 @@ class IBKRAdapter:
             "order_type": order_type,
             "signal_id": signal_id,
             "strategy_id": strategy_id,
-            "margin_change": getattr(state, "initMarginChange", None),
-            "commission": getattr(state, "commission", None),
+            "margin_change": _finite_float(getattr(state, "initMarginChange", None)),
+            "commission": _finite_float(getattr(state, "commission", None)),
             "warning_text": getattr(state, "warningText", ""),
             "execution_authorized": False,
         }
