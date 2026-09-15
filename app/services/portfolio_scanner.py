@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Lock
-import time
 from typing import Any
 
 import numpy as np
@@ -14,7 +13,8 @@ from sklearn.pipeline import Pipeline
 
 from app.config import settings
 from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series
-from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
+from app.data.twelve_data import fetch_time_series_batch
+from app.execution.ibkr_bridge_client import IBKRBridgeUnavailable, get_historical_15m_batch
 from app.features.technical import add_features
 from app.models.hierarchy import build_hierarchical_decision
 from app.risk.gate import evaluate_signal
@@ -46,6 +46,7 @@ SCAN_TRAIN_ROWS = 240
 SCAN_15M_OUTPUTSIZE = 420
 SCAN_1H_HISTORY_DAYS = 60
 SCAN_DAILY_HISTORY_DAYS = 365
+SCAN_PAIR_WORKERS = 4
 
 _STATE_LOCK = Lock()
 _STATE: dict[str, Any] = {
@@ -65,21 +66,6 @@ _STATE: dict[str, Any] = {
 }
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="portfolio-scan")
-_LAST_TWELVE_CALLS: list[float] = []
-_TWELVE_LOCK = Lock()
-
-
-def _twelve_rate_limit() -> None:
-    limit = max(1, int(settings.twelve_data_requests_per_minute))
-    while True:
-        with _TWELVE_LOCK:
-            now = time.monotonic()
-            _LAST_TWELVE_CALLS[:] = [t for t in _LAST_TWELVE_CALLS if now - t < 60.0]
-            if len(_LAST_TWELVE_CALLS) < limit:
-                _LAST_TWELVE_CALLS.append(now)
-                return
-            wait_for = max(0.1, 60.0 - (now - _LAST_TWELVE_CALLS[0]))
-        time.sleep(wait_for)
 
 
 def _classifier() -> Pipeline:
@@ -188,21 +174,77 @@ def _fast_forecast(df: pd.DataFrame, instrument: str, timeframe: str) -> dict[st
     }
 
 
-def _scan_pair(symbol: str) -> dict[str, Any]:
-    symbol = symbol.upper().replace("_", "/")
-    if "/" not in symbol and len(symbol) == 6:
-        symbol = f"{symbol[:3]}/{symbol[3:]}"
+def _rows_to_frame(rows: list[dict[str, Any]], symbol: str) -> pd.DataFrame:
+    if not rows:
+        raise RuntimeError(f"DATA UNAVAILABLE: no 15m rows returned for {symbol}.")
+    frame = pd.DataFrame(rows).copy()
+    required = ["timestamp", "open", "high", "low", "close"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise RuntimeError(f"PROVIDER ERROR: missing IBKR 15m fields for {symbol}: {missing}")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+    for column in ["open", "high", "low", "close", "volume"]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = (
+        frame.dropna(subset=required)
+        .drop_duplicates(subset=["timestamp"])
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    if frame.empty:
+        raise RuntimeError(f"DATA UNAVAILABLE: no valid IBKR 15m rows remain for {symbol}.")
+    frame["provider"] = "IBKR"
+    frame["instrument"] = symbol
+    frame["timeframe"] = "15m"
+    frame["data_status"] = "REAL_DATA"
+    return frame
 
-    frames: dict[str, pd.DataFrame] = {}
-    forecasts: list[dict[str, Any]] = []
 
-    _twelve_rate_limit()
-    fifteen = fetch_twelve_time_series(
+def _fetch_15m_frames(pairs: list[str]) -> tuple[dict[str, pd.DataFrame], str]:
+    """Get all 15m frames using the local IBKR bridge when configured.
+
+    The bridge is preferred because it does not consume Twelve Data credits.
+    When no secure bridge is configured, Twelve Data batch retrieval remains the
+    fallback. No synthetic 15m data is ever created.
+    """
+    bridge_configured = bool(str(settings.ibkr_bridge_url or "").strip())
+    if bridge_configured:
+        try:
+            raw = get_historical_15m_batch(pairs, outputsize=SCAN_15M_OUTPUTSIZE)
+            frames = {symbol: _rows_to_frame(rows, symbol) for symbol, rows in raw.items()}
+            for frame in frames.values():
+                keep_closed_candles(frame, "15m")
+            return frames, "IBKR_BRIDGE"
+        except Exception:
+            # The bridge must never mask the explicit fallback provenance.
+            # If it fails and Twelve Data is also unavailable, the scanner reports
+            # DATA UNAVAILABLE rather than fabricating market data.
+            pass
+
+    raw_frames = fetch_time_series_batch(
         settings.twelve_data_api_key,
-        symbol=symbol,
+        pairs,
         interval="15m",
         outputsize=SCAN_15M_OUTPUTSIZE,
     )
+    frames: dict[str, pd.DataFrame] = {}
+    for symbol in pairs:
+        frame = raw_frames.get(symbol)
+        if frame is None:
+            raise RuntimeError(f"DATA UNAVAILABLE: missing Twelve Data 15m frame for {symbol}.")
+        frame = keep_closed_candles(frame, "15m")
+        validate_freshness(frame, _freshness_limit("15m"), "15m")
+        frames[symbol] = frame
+    return frames, "TWELVE_DATA_BATCH"
+
+
+def _scan_pair(symbol: str, fifteen: pd.DataFrame, provider_route: str) -> dict[str, Any]:
+    symbol = symbol.upper().replace("_", "/")
+    frames: dict[str, pd.DataFrame] = {}
+    forecasts: list[dict[str, Any]] = []
+
+    fifteen = fifteen.copy(deep=True)
     fifteen = keep_closed_candles(fifteen, "15m")
     validate_freshness(fifteen, _freshness_limit("15m"), "15m")
     frames["15m"] = fifteen
@@ -265,6 +307,7 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
         "instrument": symbol,
         "status": "MODEL OUTPUT",
         "provenance": "REAL_DATA",
+        "market_data_route_15m": provider_route,
         "scanner_model": "portfolio-fast-hgb-v1",
         "training_data_role": "SCANNER_ONLY",
         "timeframes": SCAN_TIMEFRAMES,
@@ -301,27 +344,62 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
 
 
 def _run_scan(pairs: list[str]) -> None:
-    results: list[dict[str, Any]] = []
-    for raw_symbol in pairs:
-        symbol = raw_symbol.upper().replace("_", "/")
-        try:
-            result = _scan_pair(symbol)
-        except Exception as exc:
-            result = {
+    results_by_symbol: dict[str, dict[str, Any]] = {}
+    try:
+        fifteen_frames, provider_route = _fetch_15m_frames(pairs)
+    except Exception as exc:
+        # Fail fast when the 15m market-data route is unavailable. The scanner
+        # cannot claim a complete five-timeframe result without its entry timeframe.
+        provider_route = "DATA_UNAVAILABLE"
+        for symbol in pairs:
+            results_by_symbol[symbol] = {
                 "instrument": symbol,
                 "status": "DATA UNAVAILABLE",
                 "provenance": "UNKNOWN",
                 "error": str(exc),
+                "market_data_route_15m": provider_route,
                 "execution_authorized": False,
             }
-        results.append(result)
         with _STATE_LOCK:
-            _STATE["pairs_completed"] = len(results)
-            _STATE["results"] = list(results)
+            _STATE["pairs_completed"] = len(results_by_symbol)
+            _STATE["results"] = [results_by_symbol[s] for s in pairs]
+    else:
+        with ThreadPoolExecutor(max_workers=SCAN_PAIR_WORKERS, thread_name_prefix="pair-scan") as pool:
+            future_map = {
+                pool.submit(_scan_pair, symbol, fifteen_frames[symbol], provider_route): symbol
+                for symbol in pairs
+                if symbol in fifteen_frames
+            }
+            for future in as_completed(future_map):
+                symbol = future_map[future]
+                try:
+                    results_by_symbol[symbol] = future.result()
+                except Exception as exc:
+                    results_by_symbol[symbol] = {
+                        "instrument": symbol,
+                        "status": "DATA UNAVAILABLE",
+                        "provenance": "UNKNOWN",
+                        "error": str(exc),
+                        "market_data_route_15m": provider_route,
+                        "execution_authorized": False,
+                    }
+                with _STATE_LOCK:
+                    _STATE["pairs_completed"] = len(results_by_symbol)
+                    _STATE["results"] = [results_by_symbol.get(s, {"instrument": s, "status": "PENDING"}) for s in pairs]
+
+    results = [results_by_symbol.get(symbol, {
+        "instrument": symbol,
+        "status": "DATA UNAVAILABLE",
+        "provenance": "UNKNOWN",
+        "error": "15m frame unavailable.",
+        "execution_authorized": False,
+    }) for symbol in pairs]
 
     ranked = rank_scanner_results(results)
     selected = select_deep_analysis_candidates(ranked, top_n=DEFAULT_TOP_N)
     with _STATE_LOCK:
+        _STATE["results"] = list(results)
+        _STATE["pairs_completed"] = len(results)
         _STATE["ranking"] = list(ranked)
         _STATE["ranking_summary"] = ranking_summary(ranked)
         _STATE["top_candidates"] = list(selected)
@@ -440,18 +518,32 @@ def get_portfolio_results() -> dict[str, Any]:
 
 
 def get_portfolio_ranking() -> dict[str, Any]:
-    """Read all ranked scanner records without fetching or routing anything."""
-    snapshot = _snapshot(include_results=False, include_ranking=True)
-    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
-    return snapshot
+    """Read deterministic ranking without initiating a new scan."""
+    with _STATE_LOCK:
+        ranking = list(_STATE["ranking"])
+        summary = dict(_STATE["ranking_summary"])
+        status = _STATE["status"]
+    return {
+        "status": status,
+        "ranking_engine": RANKING_VERSION,
+        "ranking": ranking,
+        "portfolio_summary": summary,
+        "execution_authorized": False,
+    }
 
 
 def get_portfolio_candidates() -> dict[str, Any]:
-    """Read only selected candidates and their compact deep-analysis results."""
-    snapshot = _snapshot(include_results=False)
+    """Read only the top selected deep-analysis routing records."""
     with _STATE_LOCK:
-        snapshot["candidates"] = list(_STATE["deep_analysis_results"])
-    snapshot["candidate_count"] = len(snapshot["top_candidates"])
-    snapshot["deep_analyses_completed"] = len(snapshot["candidates"])
-    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
-    return snapshot
+        candidates = list(_STATE["top_candidates"])
+        deep = list(_STATE["deep_analysis_results"])
+        status = _STATE["status"]
+        routing_status = _STATE["routing_status"]
+    return {
+        "status": status,
+        "routing_status": routing_status,
+        "deep_analysis_router": ROUTER_VERSION,
+        "top_candidates": candidates,
+        "deep_analysis_results": deep,
+        "execution_authorized": False,
+    }
