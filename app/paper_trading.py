@@ -91,11 +91,29 @@ def _qualify(symbol: str):
     return normalized, qualified[0]
 
 
-def _order_snapshot(trade: Any, record: OrderRecord) -> dict[str, Any]:
+def _broker_diagnostics(trade: Any, captured_errors: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for entry in list(getattr(trade, "log", []) or [])[-20:]:
+        timestamp = getattr(entry, "time", None)
+        entries.append({
+            "time": timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp) if timestamp else None,
+            "status": getattr(entry, "status", None),
+            "message": getattr(entry, "message", None),
+            "error_code": getattr(entry, "errorCode", None),
+        })
+    advanced_error = str(getattr(trade, "advancedError", "") or "").strip() or None
+    return {
+        "trade_log": entries,
+        "advanced_error": advanced_error,
+        "ib_error_events": list(captured_errors or []),
+    }
+
+
+def _order_snapshot(trade: Any, record: OrderRecord, broker_diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
     status = getattr(trade.orderStatus, "status", "UNKNOWN"); filled = float(getattr(trade.orderStatus, "filled", 0.0) or 0.0); avg = getattr(trade.orderStatus, "avgFillPrice", None); avg_float = float(avg) if avg not in (None, 0, 0.0) else None
     record.status, record.filled, record.avg_fill_price = status, filled, avg_float
     if status in {"Filled", "PartiallyFilled"}: _save_record(record)
-    return {"status": "REAL_BROKER_DATA", "broker": "INTERACTIVE_BROKERS", "order": {"client_order_id": record.client_order_id, "broker_order_id": record.broker_order_id, "symbol": record.symbol, "side": record.side, "quantity": record.quantity, "order_status": status, "filled": filled, "remaining": float(getattr(trade.orderStatus, "remaining", 0.0) or 0.0), "avg_fill_price": avg_float, "signal_id": record.signal_id, "strategy_id": record.strategy_id}, "execution_authorized": False, "paper_only": True}
+    return {"status": "REAL_BROKER_DATA", "broker": "INTERACTIVE_BROKERS", "order": {"client_order_id": record.client_order_id, "broker_order_id": record.broker_order_id, "symbol": record.symbol, "side": record.side, "quantity": record.quantity, "order_status": status, "filled": filled, "remaining": float(getattr(trade.orderStatus, "remaining", 0.0) or 0.0), "avg_fill_price": avg_float, "signal_id": record.signal_id, "strategy_id": record.strategy_id}, "broker_diagnostics": broker_diagnostics or _broker_diagnostics(trade), "execution_authorized": False, "paper_only": True}
 
 
 def _portfolio_results() -> dict[str, Any]:
@@ -170,9 +188,19 @@ def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> di
         if _current_open(): raise RuntimeError("PAPER TEST BLOCKED: a controlled test order is already active.")
     result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
     if not exposure.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: portfolio exposure gate: {exposure.get('reason')}")
-    ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; order = ibi.MarketOrder(side, TEST_QUANTITY); order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
-    record = OrderRecord(client_order_id, int(getattr(order, "orderId", 0) or 0), normalized, side, TEST_QUANTITY, str(getattr(trade.orderStatus, "status", "Submitted")), 0.0, None, str(opportunity.get("signal_id") or "") or None, str(opportunity.get("strategy_id") or "forex-mtf-paper-test-v1"), _now())
-    _TRADE, _RECORD = trade, record; _save_record(record); _ib_connected().sleep(2); return _order_snapshot(trade, record)
+    ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; order = ibi.MarketOrder(side, TEST_QUANTITY); order.orderRef = client_order_id
+    ib = _ib_connected(); captured_errors: list[dict[str, Any]] = []
+    def _capture_error(req_id: Any, error_code: Any, error_string: Any, contract_obj: Any) -> None:
+        captured_errors.append({"req_id": req_id, "error_code": error_code, "message": str(error_string), "contract": getattr(contract_obj, "localSymbol", None) if contract_obj is not None else None})
+    try:
+        ib.errorEvent += _capture_error
+        trade = ib.placeOrder(contract, order)
+        record = OrderRecord(client_order_id, int(getattr(order, "orderId", 0) or 0), normalized, side, TEST_QUANTITY, str(getattr(trade.orderStatus, "status", "Submitted")), 0.0, None, str(opportunity.get("signal_id") or "") or None, str(opportunity.get("strategy_id") or "forex-mtf-paper-test-v1"), _now())
+        _TRADE, _RECORD = trade, record; _save_record(record); ib.sleep(2)
+    finally:
+        try: ib.errorEvent -= _capture_error
+        except Exception: pass
+    return _order_snapshot(trade, record, _broker_diagnostics(trade, captured_errors))
 
 
 def order_status() -> dict[str, Any]:
