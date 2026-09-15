@@ -76,6 +76,31 @@ def historical(
     }
 
 
+@app.get("/historical-batch")
+def historical_batch(
+    symbols: Annotated[list[str], Query()],
+    outputsize: int = Query(default=420, ge=1, le=500),
+    _: None = Auth,
+):
+    adapter = get_ibkr_adapter()
+    unique = list(dict.fromkeys(symbols))
+    if not unique or len(unique) > 12:
+        raise HTTPException(status_code=400, detail="Provide 1 to 12 unique FX symbols.")
+    rows: dict[str, list[dict]] = {}
+    for symbol in unique:
+        normalized = adapter.normalize_symbol(symbol)
+        try:
+            rows[normalized] = adapter.get_historical_15m(normalized, outputsize=outputsize)
+        except Exception as exc:
+            rows[normalized] = []
+    return {
+        "status": "REAL_BROKER_DATA",
+        "broker": "INTERACTIVE_BROKERS",
+        "timeframe": "15m",
+        "rows": rows,
+    }
+
+
 @app.get("/orders")
 def orders(_: None = Auth):
     # Read-only phase: intentionally do not expose order placement.
