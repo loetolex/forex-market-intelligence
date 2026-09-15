@@ -9,17 +9,12 @@ from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series, in
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
+from app.services.portfolio_scanner import DEFAULT_PORTFOLIO_PAIRS, request_portfolio_scan
 
 app = FastAPI(
     title="Forex Market Intelligence",
     version="0.2.0",
 )
-
-DEFAULT_PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "AUD/USD", "USD/CAD", "NZD/USD",
-    "EUR/GBP", "EUR/JPY", "GBP/JPY", "AUD/JPY", "NZD/JPY",
-]
 
 
 @app.get("/health")
@@ -161,31 +156,27 @@ def market(symbol: str, interval: str | None = None):
 
 
 @app.get("/portfolio")
-def portfolio(symbols: list[str] = Query(default=DEFAULT_PAIRS)):
+def portfolio(
+    symbols: list[str] = Query(default=DEFAULT_PORTFOLIO_PAIRS),
+    refresh: bool = False,
+):
+    """Return a compact five-timeframe portfolio scanner snapshot.
+
+    The scan is asynchronous so the gateway returns immediately instead of
+    waiting for all pairs to complete. Refreshing starts one background scan;
+    subsequent requests return progress/results. The detailed /market/{symbol}
+    endpoint remains the deep research path for an individual pair.
+    """
     if not symbols:
         raise HTTPException(status_code=400, detail="At least one symbol is required.")
-    if len(symbols) > len(DEFAULT_PAIRS):
-        raise HTTPException(status_code=400, detail=f"Maximum {len(DEFAULT_PAIRS)} pairs per portfolio request in this stage.")
-    results = []
-    for raw_symbol in symbols:
-        symbol = normalize_symbol(raw_symbol)
-        try:
-            results.append(run_market_cycle(symbol))
-        except Exception as exc:
-            results.append({
-                "instrument": symbol,
-                "status": "DATA UNAVAILABLE",
-                "error": str(exc),
-                "execution_authorized": False,
-            })
-    usable = [r for r in results if r.get("status") not in {"DATA UNAVAILABLE", "NOT_ADMITTED"}]
-    return {
-        "status": "MODEL OUTPUT" if usable else "DATA UNAVAILABLE",
-        "portfolio_size": len(symbols),
-        "results": results,
-        "execution_authorized": False,
-        "execution_mode": settings.trading_mode,
-    }
+    if len(symbols) > len(DEFAULT_PORTFOLIO_PAIRS):
+        raise HTTPException(status_code=400, detail=f"Maximum {len(DEFAULT_PORTFOLIO_PAIRS)} pairs per portfolio request in this stage.")
+    try:
+        return request_portfolio_scan(symbols, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/backtest/{symbol}")
