@@ -21,7 +21,9 @@ class Settings(BaseSettings):
 
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 7497
-    ibkr_client_id: int = 901
+    # 901 was already occupied by another TWS API client on the Mac. 1901 is the
+    # validated local bridge client ID currently in use.
+    ibkr_client_id: int = 1901
     # Optional authenticated local-to-Railway bridge. Leave empty until a secure
     # private network/tunnel is configured; Railway must never target 127.0.0.1.
     ibkr_bridge_url: str = ""
