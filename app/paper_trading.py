@@ -188,7 +188,7 @@ def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> di
         if _current_open(): raise RuntimeError("PAPER TEST BLOCKED: a controlled test order is already active.")
     result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
     if not exposure.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: portfolio exposure gate: {exposure.get('reason')}")
-    ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; order = ibi.MarketOrder(side, TEST_QUANTITY); order.orderRef = client_order_id
+    ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; broker_action = "BUY" if side == "LONG" else "SELL"; order = ibi.MarketOrder(broker_action, TEST_QUANTITY); order.orderRef = client_order_id
     ib = _ib_connected(); captured_errors: list[dict[str, Any]] = []
     def _capture_error(req_id: Any, error_code: Any, error_string: Any, contract_obj: Any) -> None:
         captured_errors.append({"req_id": req_id, "error_code": error_code, "message": str(error_string), "contract": getattr(contract_obj, "localSymbol", None) if contract_obj is not None else None})
@@ -241,7 +241,7 @@ def _auto_tick() -> None:
     if side not in {"LONG", "SHORT"}: return
     normalized, contract = _qualify(str(result.get("instrument") or "")); exposure = _exposure_check(normalized, side)
     if not exposure.get("approved"): return
-    ibi = _library(); order = ibi.MarketOrder(side, AUTO_QUANTITY); client_order_id = f"paper-auto-{uuid4().hex}"; order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
+    ibi = _library(); broker_action = "BUY" if side == "LONG" else "SELL"; order = ibi.MarketOrder(broker_action, AUTO_QUANTITY); client_order_id = f"paper-auto-{uuid4().hex}"; order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
     global _TRADE, _RECORD
     with _LOCK:
         _TRADE, _RECORD = trade, OrderRecord(client_order_id, int(getattr(order, "orderId", 0) or 0), normalized, side, AUTO_QUANTITY, str(getattr(trade.orderStatus, "status", "Submitted")), 0.0, None, str(opportunity.get("signal_id") or "") or None, str(opportunity.get("strategy_id") or "forex-mtf-paper-auto-v1"), _now()); _save_record(_RECORD)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import threading
 import time
+from collections import deque
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -19,6 +20,24 @@ class ProviderError(RuntimeError):
 
 _cache_lock = threading.Lock()
 _cache: dict[tuple[str, str, int], tuple[float, pd.DataFrame]] = {}
+_rate_lock = threading.Lock()
+_request_times: deque[float] = deque()
+
+
+def _wait_for_rate_slot() -> None:
+    """Enforce one Tiingo budget across scanner and deep-analysis requests."""
+    limit = max(1, int(settings.tiingo_requests_per_minute))
+    while True:
+        with _rate_lock:
+            now = time.monotonic()
+            cutoff = now - 60.0
+            while _request_times and _request_times[0] <= cutoff:
+                _request_times.popleft()
+            if len(_request_times) < limit:
+                _request_times.append(now)
+                return
+            wait_seconds = max(0.1, 60.0 - (now - _request_times[0]))
+        time.sleep(wait_seconds)
 
 
 def _get_cached(key: tuple[str, str, int], ttl_seconds: int) -> pd.DataFrame | None:
@@ -57,22 +76,32 @@ def _get(
     if not token:
         raise ProviderError("DATA UNAVAILABLE: TIINGO_API_TOKEN is not configured.")
 
-    response = httpx.get(
-        f"{BASE_URL}/tiingo/fx/{ticker}/prices",
-        params=params,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Token {token}",
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise ProviderError("PROVIDER ERROR: unexpected Tiingo FX response format.")
-    if not payload:
-        raise ProviderError("DATA UNAVAILABLE: Tiingo FX returned no values.")
-    return payload
+    retries = max(0, int(settings.tiingo_max_429_retries))
+    for attempt in range(retries + 1):
+        _wait_for_rate_slot()
+        response = httpx.get(
+            f"{BASE_URL}/tiingo/fx/{ticker}/prices",
+            params=params,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Token {token}",
+            },
+            timeout=45,
+        )
+        if response.status_code == 429:
+            if attempt >= retries:
+                raise ProviderError("DATA UNAVAILABLE: Tiingo FX rate limit reached after retry.")
+            time.sleep(max(1, int(settings.tiingo_retry_wait_seconds)))
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ProviderError("PROVIDER ERROR: unexpected Tiingo FX response format.")
+        if not payload:
+            raise ProviderError("DATA UNAVAILABLE: Tiingo FX returned no values.")
+        return payload
+
+    raise ProviderError("DATA UNAVAILABLE: Tiingo FX request could not be completed.")
 
 
 def _normalize(payload: list[dict], symbol: str, timeframe: str) -> pd.DataFrame:

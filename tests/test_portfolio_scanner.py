@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from app.services import portfolio_scanner as scanner
+from app.data import tiingo_fx
 from app.services.deep_analysis_router import run_deep_analysis_for_candidates, select_deep_analysis_candidates
 from app.services.portfolio_ranking import rank_scanner_results
 from app.services.pipeline import aggregate_from_frame, keep_closed_candles, validate_freshness
@@ -203,3 +204,28 @@ def test_router_analyzes_only_selected_top_three():
     assert [item["instrument"] for item in selected] == ["PAIR/1", "PAIR/2", "PAIR/3"]
     assert called == ["PAIR/1", "PAIR/2", "PAIR/3"]
     assert all(item["execution_authorized"] is False for item in analyses)
+
+
+def test_tiingo_429_is_retried_with_provider_pacing(monkeypatch):
+    class Response:
+        def __init__(self, status_code: int, payload=None):
+            self.status_code = status_code
+            self.payload = payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self.payload
+
+    responses = iter([Response(429), Response(200, [{"date": "2026-01-01T00:00:00Z"}])])
+    waits: list[bool] = []
+    monkeypatch.setattr(tiingo_fx, "_wait_for_rate_slot", lambda: waits.append(True))
+    monkeypatch.setattr(tiingo_fx.httpx, "get", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(tiingo_fx.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(tiingo_fx.settings, "tiingo_max_429_retries", 1)
+
+    payload = tiingo_fx._get("token", "EURUSD", {"resampleFreq": "1hour"})
+    assert payload == [{"date": "2026-01-01T00:00:00Z"}]
+    assert len(waits) == 2
