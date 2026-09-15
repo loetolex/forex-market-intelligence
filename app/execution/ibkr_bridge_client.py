@@ -49,7 +49,12 @@ def get_historical_15m(symbol: str, outputsize: int = 420) -> list[dict[str, Any
 
 
 def get_historical_15m_batch(symbols: list[str], outputsize: int = 420) -> dict[str, list[dict[str, Any]]]:
-    """Fetch 15m history for the portfolio through one authenticated bridge call."""
+    """Fetch 15m history for the portfolio through one authenticated bridge call.
+
+    Partial success is valid: pairs for which IBKR returned no bars are omitted
+    rather than causing the entire portfolio batch to fail. The scanner can then
+    evaluate available pairs and mark only the missing symbols as DATA UNAVAILABLE.
+    """
     unique = list(dict.fromkeys(str(s).upper().replace("_", "/") for s in symbols))
     if not unique or len(unique) > 12:
         raise IBKRBridgeUnavailable("BROKER ERROR: bridge batch supports 1 to 12 symbols.")
@@ -58,19 +63,22 @@ def get_historical_15m_batch(symbols: list[str], outputsize: int = 420) -> dict[
             f"{_base_url()}/historical-batch",
             params=[("symbols", symbol) for symbol in unique] + [("outputsize", int(outputsize))],
             headers=_headers(),
-            timeout=max(float(settings.ibkr_bridge_timeout_seconds), 30.0),
+            timeout=max(float(settings.ibkr_bridge_timeout_seconds), 120.0),
         )
         response.raise_for_status()
         payload = response.json()
         rows = payload.get("rows")
         if not isinstance(rows, dict):
             raise IBKRBridgeUnavailable("DATA UNAVAILABLE: IBKR bridge returned invalid batch history.")
+
         result: dict[str, list[dict[str, Any]]] = {}
         for symbol in unique:
             symbol_rows = rows.get(symbol) or rows.get(symbol.replace("/", ""))
-            if not isinstance(symbol_rows, list) or not symbol_rows:
-                raise IBKRBridgeUnavailable(f"DATA UNAVAILABLE: IBKR bridge returned no 15m bars for {symbol}.")
-            result[symbol] = symbol_rows
+            if isinstance(symbol_rows, list) and symbol_rows:
+                result[symbol] = symbol_rows
+
+        if not result:
+            raise IBKRBridgeUnavailable("DATA UNAVAILABLE: IBKR bridge returned no usable 15m bars for the requested portfolio.")
         return result
     except (httpx.HTTPError, ValueError) as exc:
         raise IBKRBridgeUnavailable(f"DATA UNAVAILABLE: IBKR bridge batch request failed: {exc}") from exc
