@@ -18,6 +18,13 @@ from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.features.technical import add_features
 from app.models.hierarchy import build_hierarchical_decision
 from app.risk.gate import evaluate_signal
+from app.services.deep_analysis_router import (
+    DEFAULT_TOP_N,
+    ROUTER_VERSION,
+    run_deep_analysis_for_candidates,
+    select_deep_analysis_candidates,
+)
+from app.services.portfolio_ranking import RANKING_VERSION, rank_scanner_results, ranking_summary
 from app.services.pipeline import (
     _run_shadow_learning,
     _freshness_limit,
@@ -49,6 +56,11 @@ _STATE: dict[str, Any] = {
     "pairs_total": len(DEFAULT_PORTFOLIO_PAIRS),
     "pairs_completed": 0,
     "results": [],
+    "ranking": [],
+    "ranking_summary": {},
+    "top_candidates": [],
+    "deep_analysis_results": [],
+    "routing_status": "IDLE",
     "last_error": None,
 }
 
@@ -239,11 +251,13 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
     for item in forecasts:
         p = item.get("probability_up")
         stage_summary[item["timeframe"]] = {
-            "direction": "LONG" if (p or 0.5) > 0.52 else "SHORT" if (p or 0.5) < 0.48 else "NEUTRAL",
+            "direction": "LONG" if (p if p is not None else 0.5) > 0.52 else "SHORT" if (p if p is not None else 0.5) < 0.48 else "NEUTRAL",
             "probability_up": p,
             "regime": (item.get("regime") or {}).get("regime"),
             "data_status": "REAL_DATA",
             "last_timestamp": str(frames[item["timeframe"]]["timestamp"].max()),
+            "validation_status": item.get("validation_status", "NOT_EVALUATED"),
+            "forecast_status": item.get("status", "DATA UNAVAILABLE"),
         }
 
     stats = shadow.get("stats", {})
@@ -305,7 +319,19 @@ def _run_scan(pairs: list[str]) -> None:
             _STATE["pairs_completed"] = len(results)
             _STATE["results"] = list(results)
 
+    ranked = rank_scanner_results(results)
+    selected = select_deep_analysis_candidates(ranked, top_n=DEFAULT_TOP_N)
     with _STATE_LOCK:
+        _STATE["ranking"] = list(ranked)
+        _STATE["ranking_summary"] = ranking_summary(ranked)
+        _STATE["top_candidates"] = list(selected)
+        _STATE["routing_status"] = "DEEP_ANALYSIS_RUNNING" if selected else "NO_CANDIDATES_READY"
+
+    # This is deliberately limited to selected candidates, not the full portfolio.
+    deep_results = run_deep_analysis_for_candidates(selected)
+    with _STATE_LOCK:
+        _STATE["deep_analysis_results"] = list(deep_results)
+        _STATE["routing_status"] = "COMPLETE" if selected else "NO_CANDIDATES_READY"
         _STATE["status"] = "COMPLETE"
         _STATE["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
 
@@ -323,25 +349,36 @@ def _normalized_pairs(pairs: list[str] | None) -> list[str]:
     return normalized
 
 
-def _snapshot(include_results: bool) -> dict[str, Any]:
+def _snapshot(include_results: bool, include_ranking: bool = False) -> dict[str, Any]:
     with _STATE_LOCK:
         snapshot = dict(_STATE)
         snapshot["pairs"] = list(_STATE["pairs"])
         snapshot["results"] = list(_STATE["results"]) if include_results else []
+        snapshot["ranking"] = list(_STATE["ranking"])
+        snapshot["ranking_summary"] = dict(_STATE["ranking_summary"])
+        snapshot["top_candidates"] = list(_STATE["top_candidates"])
+        snapshot["deep_analysis_results"] = list(_STATE["deep_analysis_results"])
     response = {
         "status": snapshot["status"],
         "scanner": "LIGHTWEIGHT_ASYNC_5TF_V1",
         "model": "portfolio-fast-hgb-v1",
         "training_data_role": "SCANNER_ONLY",
+        "ranking_engine": RANKING_VERSION,
+        "deep_analysis_router": ROUTER_VERSION,
         "pairs_total": snapshot["pairs_total"],
         "pairs_completed": snapshot["pairs_completed"],
         "started_at_utc": snapshot["started_at_utc"],
         "completed_at_utc": snapshot["completed_at_utc"],
         "execution_authorized": False,
         "execution_mode": settings.trading_mode,
+        "routing_status": snapshot["routing_status"],
+        "portfolio_summary": snapshot["ranking_summary"],
+        "top_candidates": snapshot["top_candidates"],
     }
     if include_results:
         response["results"] = snapshot["results"]
+    if include_ranking:
+        response["ranking"] = snapshot["ranking"]
     return response
 
 
@@ -356,6 +393,11 @@ def _start_scan(pairs: list[str]) -> None:
             "pairs_total": len(pairs),
             "pairs_completed": 0,
             "results": [],
+            "ranking": [],
+            "ranking_summary": {},
+            "top_candidates": [],
+            "deep_analysis_results": [],
+            "routing_status": "SCANNING",
             "last_error": None,
         })
     try:
@@ -378,7 +420,7 @@ def request_portfolio_scan(pairs: list[str] | None = None, refresh: bool = False
     if status != "RUNNING" and (refresh or status == "IDLE" or not same_pairs):
         _start_scan(normalized)
 
-    snapshot = _snapshot(include_results=False)
+    snapshot = _snapshot(include_results=False, include_ranking=True)
     snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
     return snapshot
 
@@ -392,6 +434,24 @@ def get_portfolio_status() -> dict[str, Any]:
 
 def get_portfolio_results() -> dict[str, Any]:
     """Read compact completed/partial results without starting a scan."""
-    snapshot = _snapshot(include_results=True)
+    snapshot = _snapshot(include_results=True, include_ranking=True)
+    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
+    return snapshot
+
+
+def get_portfolio_ranking() -> dict[str, Any]:
+    """Read all ranked scanner records without fetching or routing anything."""
+    snapshot = _snapshot(include_results=False, include_ranking=True)
+    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
+    return snapshot
+
+
+def get_portfolio_candidates() -> dict[str, Any]:
+    """Read only selected candidates and their compact deep-analysis results."""
+    snapshot = _snapshot(include_results=False)
+    with _STATE_LOCK:
+        snapshot["candidates"] = list(_STATE["deep_analysis_results"])
+    snapshot["candidate_count"] = len(snapshot["top_candidates"])
+    snapshot["deep_analyses_completed"] = len(snapshot["candidates"])
     snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
     return snapshot

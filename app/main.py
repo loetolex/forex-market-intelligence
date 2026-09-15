@@ -11,6 +11,8 @@ from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
 from app.services.portfolio_scanner import (
     DEFAULT_PORTFOLIO_PAIRS,
+    get_portfolio_candidates,
+    get_portfolio_ranking,
     get_portfolio_results,
     get_portfolio_status,
     request_portfolio_scan,
@@ -194,6 +196,18 @@ def portfolio_status():
 def portfolio_results():
     """Read compact portfolio results without initiating a scan."""
     return get_portfolio_results()
+
+
+@app.get("/portfolio/ranking")
+def portfolio_ranking():
+    """Read the deterministic all-pair ranking without initiating a scan."""
+    return get_portfolio_ranking()
+
+
+@app.get("/portfolio/candidates")
+def portfolio_candidates():
+    """Read selected deep-analysis candidates without initiating a scan."""
+    return get_portfolio_candidates()
 
 
 @app.get("/backtest/{symbol}")

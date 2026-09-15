@@ -167,6 +167,22 @@ The scanner uses Twelve Data 15m bars (deriving 30m), Tiingo 1h bars
 is labelled `SCANNER_ONLY`; it is not a research-admitted model and cannot
 authorize execution.
 
+After completion, the baseline top-down hierarchy ranks all available pairs.
+The deterministic score rewards five-timeframe alignment, 1D/4H/1H strength,
+meaningful hierarchy edge, compatible regime, and fresh complete data. Shadow
+RL agreement is exposed for comparison only; it does not change a rank or a
+routing decision.
+
+```text
+GET /portfolio/ranking
+GET /portfolio/candidates
+```
+
+Only up to three `READY_FOR_DEEP_ANALYSIS` records are routed directly into the
+existing `/market/{symbol}` Python pipeline. Non-selected pairs are never
+deep-analyzed by a portfolio request. Candidate responses remain compact and
+all risk and execution locks remain in force.
+
 ## Railway
 
 Use the existing Railway `forex-api` service connected to this repository.
