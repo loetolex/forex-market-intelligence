@@ -36,16 +36,20 @@ def _find(forecasts: list[dict[str, Any]], timeframe: str) -> dict[str, Any] | N
 
 
 def build_hierarchical_decision(forecasts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Turn five independent forecasts into a top-down trading state.
+    """Turn five timeframe forecasts into a top-down trading state.
 
     Hierarchy:
     1D bias -> 4H confirmation -> 1H setup -> 30M refinement -> 15M entry.
 
-    This function never places orders and deliberately favors NO TRADE when the
-    hierarchy conflicts or the final entry trigger is not aligned.
+    The resulting baseline policy remains separate from shadow RL. RL can learn
+    from the same state but cannot override this decision or authorize orders.
     """
     by_tf = {tf: _find(forecasts, tf) for tf in TIMEFRAME_ORDER}
-    usable = {tf: item for tf, item in by_tf.items() if item and item.get("status") == "MODEL OUTPUT"}
+    usable = {
+        tf: item
+        for tf, item in by_tf.items()
+        if item and item.get("status") == "MODEL OUTPUT"
+    }
 
     stages: dict[str, dict[str, Any]] = {}
     signed_score = 0.0
@@ -88,15 +92,17 @@ def build_hierarchical_decision(forecasts: list[dict[str, Any]]) -> dict[str, An
     aligned_count = sum(1 for d in alignment_directions if d == primary_bias)
     non_neutral_count = sum(1 for d in alignment_directions if d in {"LONG", "SHORT"})
 
-    # Keep the existing 10-point edge philosophy, but apply it to the hierarchy
-    # score rather than a simple mean of five probabilities.
     hierarchy_edge = abs(signed_score) * 50.0
     candidate = "NO TRADE"
     if entry_trigger and hierarchy_edge >= 10.0:
         candidate = "LONG CANDIDATE" if signed_score > 0 else "SHORT CANDIDATE"
 
-    probability_up = 0.50 + (signed_score / 2.0)
-    probability_up = max(0.0, min(1.0, probability_up))
+    probability_up = max(0.0, min(1.0, 0.50 + (signed_score / 2.0)))
+    baseline_action = {
+        "LONG CANDIDATE": "LONG",
+        "SHORT CANDIDATE": "SHORT",
+        "NO TRADE": "NO_TRADE",
+    }[candidate]
 
     return {
         "status": "MODEL OUTPUT" if usable else "DATA UNAVAILABLE",
@@ -116,5 +122,6 @@ def build_hierarchical_decision(forecasts: list[dict[str, Any]]) -> dict[str, An
         "probability_up": probability_up,
         "probability_down": 1.0 - probability_up,
         "candidate_signal": candidate,
+        "baseline_action": baseline_action,
         "decision_rule": "1D bias -> 4H confirmation -> 1H setup -> 30M refinement -> 15M entry; edge >= 10pp; conflicts veto trade",
     }
