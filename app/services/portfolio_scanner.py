@@ -43,6 +43,7 @@ SCAN_DAILY_HISTORY_DAYS = 365
 _STATE_LOCK = Lock()
 _STATE: dict[str, Any] = {
     "status": "IDLE",
+    "pairs": [],
     "started_at_utc": None,
     "completed_at_utc": None,
     "pairs_total": len(DEFAULT_PORTFOLIO_PAIRS),
@@ -250,6 +251,8 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
         "instrument": symbol,
         "status": "MODEL OUTPUT",
         "provenance": "REAL_DATA",
+        "scanner_model": "portfolio-fast-hgb-v1",
+        "training_data_role": "SCANNER_ONLY",
         "timeframes": SCAN_TIMEFRAMES,
         "hierarchical_forecast": {
             "method": hierarchical.get("method"),
@@ -284,17 +287,6 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
 
 
 def _run_scan(pairs: list[str]) -> None:
-    with _STATE_LOCK:
-        _STATE.update({
-            "status": "RUNNING",
-            "started_at_utc": datetime.now(timezone.utc).isoformat(),
-            "completed_at_utc": None,
-            "pairs_total": len(pairs),
-            "pairs_completed": 0,
-            "results": [],
-            "last_error": None,
-        })
-
     results: list[dict[str, Any]] = []
     for raw_symbol in pairs:
         symbol = raw_symbol.upper().replace("_", "/")
@@ -318,35 +310,88 @@ def _run_scan(pairs: list[str]) -> None:
         _STATE["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
 
 
-def request_portfolio_scan(pairs: list[str] | None = None, refresh: bool = False) -> dict[str, Any]:
+def _normalized_pairs(pairs: list[str] | None) -> list[str]:
     requested = pairs or DEFAULT_PORTFOLIO_PAIRS
-    if len(requested) > len(DEFAULT_PORTFOLIO_PAIRS):
-        raise ValueError(f"Maximum {len(DEFAULT_PORTFOLIO_PAIRS)} pairs per portfolio request in this stage.")
     normalized = [p.upper().replace("_", "/") for p in requested]
+    if len(normalized) > len(DEFAULT_PORTFOLIO_PAIRS):
+        raise ValueError(f"Maximum {len(DEFAULT_PORTFOLIO_PAIRS)} pairs per portfolio request in this stage.")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Portfolio symbols must be unique.")
+    unsupported = sorted(set(normalized) - set(DEFAULT_PORTFOLIO_PAIRS))
+    if unsupported:
+        raise ValueError(f"Unsupported portfolio symbols: {', '.join(unsupported)}")
+    return normalized
 
-    with _STATE_LOCK:
-        status = _STATE["status"]
-        has_results = bool(_STATE["results"])
 
-    if refresh or (status == "IDLE" and not has_results):
-        with _STATE_LOCK:
-            already_running = _STATE["status"] == "RUNNING"
-        if not already_running:
-            _EXECUTOR.submit(_run_scan, normalized)
-
+def _snapshot(include_results: bool) -> dict[str, Any]:
     with _STATE_LOCK:
         snapshot = dict(_STATE)
-        snapshot["results"] = list(_STATE["results"])
-
-    return {
+        snapshot["pairs"] = list(_STATE["pairs"])
+        snapshot["results"] = list(_STATE["results"]) if include_results else []
+    response = {
         "status": snapshot["status"],
         "scanner": "LIGHTWEIGHT_ASYNC_5TF_V1",
-        "refresh_in_background": snapshot["status"] == "RUNNING",
+        "model": "portfolio-fast-hgb-v1",
+        "training_data_role": "SCANNER_ONLY",
         "pairs_total": snapshot["pairs_total"],
         "pairs_completed": snapshot["pairs_completed"],
         "started_at_utc": snapshot["started_at_utc"],
         "completed_at_utc": snapshot["completed_at_utc"],
-        "results": snapshot["results"],
         "execution_authorized": False,
         "execution_mode": settings.trading_mode,
     }
+    if include_results:
+        response["results"] = snapshot["results"]
+    return response
+
+
+def _start_scan(pairs: list[str]) -> None:
+    """Reserve the sole worker before submitting it, preventing duplicate scans."""
+    with _STATE_LOCK:
+        _STATE.update({
+            "status": "RUNNING",
+            "pairs": list(pairs),
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "completed_at_utc": None,
+            "pairs_total": len(pairs),
+            "pairs_completed": 0,
+            "results": [],
+            "last_error": None,
+        })
+    try:
+        _EXECUTOR.submit(_run_scan, pairs)
+    except Exception:
+        with _STATE_LOCK:
+            _STATE["status"] = "FAILED"
+            _STATE["last_error"] = "Unable to start portfolio scanner worker."
+            _STATE["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        raise
+
+
+def request_portfolio_scan(pairs: list[str] | None = None, refresh: bool = False) -> dict[str, Any]:
+    normalized = _normalized_pairs(pairs)
+    with _STATE_LOCK:
+        status = _STATE["status"]
+        same_pairs = _STATE["pairs"] == normalized
+
+    # A running scan always wins. A refresh is intentionally not queued behind it.
+    if status != "RUNNING" and (refresh or status == "IDLE" or not same_pairs):
+        _start_scan(normalized)
+
+    snapshot = _snapshot(include_results=False)
+    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
+    return snapshot
+
+
+def get_portfolio_status() -> dict[str, Any]:
+    """Read scanner progress without fetching data or starting a scan."""
+    snapshot = _snapshot(include_results=False)
+    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
+    return snapshot
+
+
+def get_portfolio_results() -> dict[str, Any]:
+    """Read compact completed/partial results without starting a scan."""
+    snapshot = _snapshot(include_results=True)
+    snapshot["refresh_in_background"] = snapshot["status"] == "RUNNING"
+    return snapshot

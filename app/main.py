@@ -9,7 +9,12 @@ from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series, in
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_readonly import read_only_status
 from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
-from app.services.portfolio_scanner import DEFAULT_PORTFOLIO_PAIRS, request_portfolio_scan
+from app.services.portfolio_scanner import (
+    DEFAULT_PORTFOLIO_PAIRS,
+    get_portfolio_results,
+    get_portfolio_status,
+    request_portfolio_scan,
+)
 
 app = FastAPI(
     title="Forex Market Intelligence",
@@ -177,6 +182,18 @@ def portfolio(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/portfolio/status")
+def portfolio_status():
+    """Read portfolio scan progress without initiating a scan."""
+    return get_portfolio_status()
+
+
+@app.get("/portfolio/results")
+def portfolio_results():
+    """Read compact portfolio results without initiating a scan."""
+    return get_portfolio_results()
 
 
 @app.get("/backtest/{symbol}")

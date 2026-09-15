@@ -152,6 +152,21 @@ Portfolio snapshot (12 default pairs):
 GET /portfolio
 ```
 
+`/portfolio` starts the lightweight, single-worker scanner and returns promptly.
+It never runs the deep `/market/{symbol}` research cycle for every pair. Poll
+these read-only endpoints while it is running; neither starts another scan:
+
+```text
+GET /portfolio/status
+GET /portfolio/results
+```
+
+Completed results are cached in process until `GET /portfolio?refresh=true`.
+The scanner uses Twelve Data 15m bars (deriving 30m), Tiingo 1h bars
+(deriving 4h), and Tiingo native 1D bars. Its `portfolio-fast-hgb-v1` output
+is labelled `SCANNER_ONLY`; it is not a research-admitted model and cannot
+authorize execution.
+
 ## Railway
 
 Use the existing Railway `forex-api` service connected to this repository.
