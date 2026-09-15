@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import asyncio
 import math
 from threading import RLock
 from typing import Any
@@ -223,6 +224,25 @@ class IBKRAdapter:
             "data_note": "REAL_BROKER_DATA; null means IBKR did not provide a finite value for that field.",
         }
 
+    @staticmethod
+    def _serialize_bars(symbol: str, bars: Any, outputsize: int) -> list[dict[str, Any]]:
+        rows = list(bars or [])[-max(1, int(outputsize)):]
+        return [
+            {
+                "timestamp": bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date),
+                "open": _finite_float(bar.open),
+                "high": _finite_float(bar.high),
+                "low": _finite_float(bar.low),
+                "close": _finite_float(bar.close),
+                "volume": _finite_float(bar.volume),
+                "provider": "IBKR",
+                "instrument": IBKRAdapter.normalize_symbol(symbol),
+                "timeframe": "15m",
+                "data_status": "REAL_DATA",
+            }
+            for bar in rows
+        ]
+
     def get_historical_15m(self, symbol: str, outputsize: int = 420) -> list[dict[str, Any]]:
         ib = self._connected_ib()
         contract = self._qualify_forex(symbol)
@@ -236,22 +256,56 @@ class IBKRAdapter:
             formatDate=2,
             keepUpToDate=False,
         )
-        rows = list(bars or [])[-max(1, int(outputsize)):]
-        return [
-            {
-                "timestamp": bar.date.isoformat() if hasattr(bar.date, "isoformat") else str(bar.date),
-                "open": _finite_float(bar.open),
-                "high": _finite_float(bar.high),
-                "low": _finite_float(bar.low),
-                "close": _finite_float(bar.close),
-                "volume": _finite_float(bar.volume),
-                "provider": "IBKR",
-                "instrument": self.normalize_symbol(symbol),
-                "timeframe": "15m",
-                "data_status": "REAL_DATA",
-            }
-            for bar in rows
-        ]
+        return self._serialize_bars(symbol, bars, outputsize)
+
+    async def get_historical_15m_async(self, symbol: str, outputsize: int = 420) -> list[dict[str, Any]]:
+        """Async historical request so the portfolio batch can fan out without
+        serially blocking the public bridge request."""
+        ib = self._connected_ib()
+        contract = self._qualify_forex(symbol)
+        request_async = getattr(ib, "reqHistoricalDataAsync", None)
+        if request_async is None:
+            # Compatibility fallback for an older ib_async build.
+            return await asyncio.to_thread(self.get_historical_15m, symbol, outputsize)
+        bars = await request_async(
+            contract,
+            endDateTime="",
+            durationStr="7 D",
+            barSizeSetting="15 mins",
+            whatToShow="MIDPOINT",
+            useRTH=False,
+            formatDate=2,
+            keepUpToDate=False,
+        )
+        return self._serialize_bars(symbol, bars, outputsize)
+
+    async def get_historical_15m_batch_async(
+        self,
+        symbols: list[str],
+        outputsize: int = 420,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Concurrent IBKR 15m history for up to 12 unique FX symbols."""
+        unique = list(dict.fromkeys(self.normalize_symbol(symbol) for symbol in symbols))
+        if not unique or len(unique) > 12:
+            raise ValueError("Provide 1 to 12 unique FX symbols.")
+
+        results = await asyncio.gather(
+            *(self.get_historical_15m_async(symbol, outputsize) for symbol in unique),
+            return_exceptions=True,
+        )
+
+        rows: dict[str, list[dict[str, Any]]] = {}
+        errors: list[str] = []
+        for symbol, result in zip(unique, results):
+            if isinstance(result, Exception):
+                rows[symbol] = []
+                errors.append(f"{symbol}: {type(result).__name__}: {result}")
+            else:
+                rows[symbol] = result
+
+        if not any(rows.values()) and errors:
+            raise RuntimeError("BROKER DATA UNAVAILABLE: no IBKR 15m batches returned. " + " | ".join(errors))
+        return rows
 
     @staticmethod
     def validate_order_quantity(contract_info: dict[str, Any], quantity: float) -> dict[str, Any]:
