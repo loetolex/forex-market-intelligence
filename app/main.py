@@ -32,6 +32,7 @@ def health():
         "mode": settings.trading_mode,
         "live_trading_enabled": settings.live_trading_enabled,
         "order_placement_enabled": settings.order_placement_enabled,
+        "paper_order_placement_enabled": settings.paper_order_placement_enabled,
         "market_data": {
             "primary": settings.market_data_provider,
             "secondary": settings.secondary_market_data_provider,
@@ -43,7 +44,16 @@ def health():
             "forecast_intervals": settings.forecast_intervals,
             "freshness_limits_minutes": settings.freshness_limits_minutes,
         },
-        "broker": read_only_status().__dict__,
+        "broker": {
+            **read_only_status().__dict__,
+            "bridge_configured": bool(settings.ibkr_bridge_url),
+        },
+        "execution_safety": {
+            "forecast_can_place_orders": False,
+            "rl_can_authorize_execution": False,
+            "live_execution": "LOCKED",
+            "paper_submission": "LOCKED",
+        },
     }
 
 
