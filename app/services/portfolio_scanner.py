@@ -15,20 +15,17 @@ from sklearn.pipeline import Pipeline
 from app.config import settings
 from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
+from app.features.technical import add_features
 from app.models.hierarchy import build_hierarchical_decision
-from app.models.hierarchy import TIMEFRAME_ORDER
-from app.models.multi_timeframe import add_features if False else None
 from app.risk.gate import evaluate_signal
 from app.services.pipeline import (
     _run_shadow_learning,
+    _freshness_limit,
     aggregate_from_frame,
     keep_closed_candles,
     normalize_native_daily_sessions,
     validate_freshness,
-    _freshness_limit,
 )
-
-from app.features.technical import add_features
 
 DEFAULT_PORTFOLIO_PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
@@ -233,21 +230,22 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
     frames["1day"] = daily
     forecasts.append(_fast_forecast(daily, symbol, "1day"))
 
-    # Every pair follows the same top-down hierarchy: 1D -> 4H -> 1H -> 30M -> 15M.
     hierarchical = build_hierarchical_decision(forecasts)
     risk = evaluate_signal(hierarchical.get("probability_up"))
     shadow = _run_shadow_learning(symbol, hierarchical, frames["15m"])
 
     stage_summary = {}
     for item in forecasts:
+        p = item.get("probability_up")
         stage_summary[item["timeframe"]] = {
-            "direction": "LONG" if (item.get("probability_up") or 0.5) > 0.52 else "SHORT" if (item.get("probability_up") or 0.5) < 0.48 else "NEUTRAL",
-            "probability_up": item.get("probability_up"),
+            "direction": "LONG" if (p or 0.5) > 0.52 else "SHORT" if (p or 0.5) < 0.48 else "NEUTRAL",
+            "probability_up": p,
             "regime": (item.get("regime") or {}).get("regime"),
             "data_status": "REAL_DATA",
             "last_timestamp": str(frames[item["timeframe"]]["timestamp"].max()),
         }
 
+    stats = shadow.get("stats", {})
     return {
         "instrument": symbol,
         "status": "MODEL OUTPUT",
@@ -275,7 +273,7 @@ def _scan_pair(symbol: str) -> dict[str, Any]:
             "policy_action": shadow.get("policy_action"),
             "baseline_action": shadow.get("baseline_action"),
             "pending_experiences": shadow.get("pending_experiences"),
-            "transitions_learned": shadow.get("transitions_learned", shadow.get("stats", {}).get("transitions_learned", 0)),
+            "transitions_learned": shadow.get("transitions_learned", stats.get("transitions_learned", 0)),
             "advisory_only": True,
             "execution_authorized": False,
         },
