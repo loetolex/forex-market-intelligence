@@ -46,12 +46,19 @@ def _context(timeframe: str, direction: str, directions: dict[str, str]) -> dict
     available = {tf: value for tf, value in higher.items() if value in {"LONG", "SHORT"}}
     if not available:
         classification = "PRIMARY_BIAS"
-    elif all(value == direction for value in available.values()):
-        classification = "TREND_ALIGNED"
-    elif all(value != direction for value in available.values()):
-        classification = "COUNTER_TREND"
     else:
-        classification = "MIXED"
+        same = sum(1 for value in available.values() if value == direction)
+        opposite = len(available) - same
+        if same == len(available):
+            classification = "TREND_ALIGNED"
+        elif opposite == len(available):
+            classification = "COUNTER_TREND"
+        elif opposite > same:
+            classification = "COUNTER_TREND"
+        elif same > opposite:
+            classification = "TREND_ALIGNED"
+        else:
+            classification = "MIXED"
     return {"classification": classification, "higher_timeframes": higher}
 
 
@@ -76,86 +83,40 @@ def _levels(frame: pd.DataFrame, direction: str, config: dict[str, Any]) -> dict
         return {"status": "DATA UNAVAILABLE"}
     if stop <= 0 or target <= 0:
         return {"status": "DATA UNAVAILABLE"}
-    return {
-        "status": "CALCULATED",
-        "reference_price": close_f,
-        "atr_14": atr_f,
-        "stop_loss": float(stop),
-        "take_profit": float(target),
-        "stop_atr_multiple": config["stop_atr"],
-        "target_atr_multiple": config["target_atr"],
-        "reference_timestamp": str(pd.to_datetime(latest["timestamp"], utc=True)),
-    }
+    return {"status": "CALCULATED", "reference_price": close_f, "atr_14": atr_f, "stop_loss": float(stop), "take_profit": float(target), "stop_atr_multiple": config["stop_atr"], "target_atr_multiple": config["target_atr"], "reference_timestamp": str(pd.to_datetime(latest["timestamp"], utc=True))}
 
 
-def build_timeframe_opportunities(
-    forecasts: list[dict[str, Any]],
-    frames: dict[str, pd.DataFrame],
-) -> dict[str, dict[str, Any]]:
+def build_timeframe_opportunities(forecasts: list[dict[str, Any]], frames: dict[str, pd.DataFrame]) -> dict[str, dict[str, Any]]:
     by_tf = {item.get("timeframe"): item for item in forecasts}
     directions = {tf: _direction((by_tf.get(tf) or {}).get("probability_up")) for tf in TIMEFRAME_ORDER}
     opportunities: dict[str, dict[str, Any]] = {}
     for timeframe in TIMEFRAME_ORDER:
-        forecast = by_tf.get(timeframe) or {}
-        config = TIMEFRAME_STRATEGIES[timeframe]
-        probability_up = forecast.get("probability_up")
-        probability_down = forecast.get("probability_down")
-        direction = directions[timeframe]
-        status = forecast.get("status", "DATA UNAVAILABLE")
+        forecast = by_tf.get(timeframe) or {}; config = TIMEFRAME_STRATEGIES[timeframe]
+        probability_up = forecast.get("probability_up"); probability_down = forecast.get("probability_down"); direction = directions[timeframe]; status = forecast.get("status", "DATA UNAVAILABLE")
         valid_model = status == "MODEL OUTPUT" and probability_up is not None and probability_down is not None
         edge = abs(float(probability_up) - 0.50) * 100.0 if valid_model else None
         entry_signal = bool(valid_model and direction in {"LONG", "SHORT"} and edge is not None and edge >= MIN_SIGNAL_EDGE_PERCENTAGE_POINTS)
         levels = _levels(frames.get(timeframe, pd.DataFrame()), direction, config) if entry_signal else {"status": "NOT_REQUIRED"}
         context = _context(timeframe, direction, directions)
-        prediction_timestamp = forecast.get("prediction_timestamp")
-        signal_id = _signal_id(str(forecast.get("instrument") or "UNKNOWN"), timeframe, prediction_timestamp, direction)
+        signal_id = _signal_id(str(forecast.get("instrument") or "UNKNOWN"), timeframe, forecast.get("prediction_timestamp"), direction)
         if not valid_model:
-            entry_status = "DATA_UNAVAILABLE"
-            entry_reason = str(forecast.get("reason") or "MODEL_OUTPUT_UNAVAILABLE")
+            entry_status, entry_reason = "DATA_UNAVAILABLE", str(forecast.get("reason") or "MODEL_OUTPUT_UNAVAILABLE")
         elif direction == "NEUTRAL":
-            entry_status = "NO TRADE"
-            entry_reason = "PROBABILITY_WITHIN_NEUTRAL_BAND"
+            entry_status, entry_reason = "NO TRADE", "PROBABILITY_WITHIN_NEUTRAL_BAND"
         elif not entry_signal:
-            entry_status = "NO TRADE"
-            entry_reason = "INSUFFICIENT_TIMEFRAME_EDGE"
+            entry_status, entry_reason = "NO TRADE", "INSUFFICIENT_TIMEFRAME_EDGE"
         elif levels.get("status") != "CALCULATED":
-            entry_signal = False
-            entry_status = "DATA_UNAVAILABLE"
-            entry_reason = "ATR_LEVELS_UNAVAILABLE"
+            entry_signal, entry_status, entry_reason = False, "DATA_UNAVAILABLE", "ATR_LEVELS_UNAVAILABLE"
         else:
-            entry_status = "SIGNAL GENERATED"
-            entry_reason = "TIMEFRAME_EDGE_THRESHOLD_MET"
+            entry_status, entry_reason = "SIGNAL GENERATED", "TIMEFRAME_EDGE_THRESHOLD_MET"
         opportunities[timeframe] = {
-            "strategy_id": config["strategy_id"],
-            "signal_id": signal_id,
-            "instrument": forecast.get("instrument"),
-            "timeframe": timeframe,
-            "prediction": direction,
-            "probability_up": probability_up,
-            "probability_down": probability_down,
-            "confidence": forecast.get("confidence"),
-            "expected_return": forecast.get("expected_return"),
-            "expected_abs_move": forecast.get("expected_abs_move"),
-            "uncertainty": forecast.get("uncertainty"),
-            "regime": (forecast.get("regime") or {}).get("regime", "UNKNOWN"),
-            "entry_signal": entry_signal,
-            "entry_status": entry_status,
-            "entry_reason": entry_reason,
-            "holding_horizon": config["holding_horizon"],
-            "exit_framework": {
-                "method": "ATR_14_REFERENCE",
-                "stop_atr_multiple": config["stop_atr"],
-                "target_atr_multiple": config["target_atr"],
-                "status": levels.get("status", "DATA UNAVAILABLE"),
-            },
-            "reference_price": levels.get("reference_price"),
-            "stop_loss": levels.get("stop_loss"),
-            "take_profit": levels.get("take_profit"),
-            "reference_timestamp": levels.get("reference_timestamp"),
-            "context": context,
-            "status": status if valid_model else "DATA UNAVAILABLE",
-            "validation_status": forecast.get("validation_status", "NOT_EVALUATED"),
-            "data_status": "REAL_DATA" if valid_model else "DATA_UNAVAILABLE",
-            "execution_authorized": False,
+            "strategy_id": config["strategy_id"], "signal_id": signal_id, "instrument": forecast.get("instrument"), "timeframe": timeframe,
+            "prediction": direction, "probability_up": probability_up, "probability_down": probability_down, "confidence": forecast.get("confidence"),
+            "expected_return": forecast.get("expected_return"), "expected_abs_move": forecast.get("expected_abs_move"), "uncertainty": forecast.get("uncertainty"),
+            "regime": (forecast.get("regime") or {}).get("regime", "UNKNOWN"), "entry_signal": entry_signal, "entry_status": entry_status, "entry_reason": entry_reason,
+            "holding_horizon": config["holding_horizon"], "exit_framework": {"method": "ATR_14_REFERENCE", "stop_atr_multiple": config["stop_atr"], "target_atr_multiple": config["target_atr"], "status": levels.get("status", "DATA UNAVAILABLE")},
+            "reference_price": levels.get("reference_price"), "stop_loss": levels.get("stop_loss"), "take_profit": levels.get("take_profit"), "reference_timestamp": levels.get("reference_timestamp"),
+            "context": context, "status": status if valid_model else "DATA UNAVAILABLE", "validation_status": forecast.get("validation_status", "NOT_EVALUATED"),
+            "data_status": "REAL_DATA" if valid_model else "DATA_UNAVAILABLE", "execution_authorized": False,
         }
     return opportunities
