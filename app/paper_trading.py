@@ -12,6 +12,7 @@ from uuid import uuid4
 import httpx
 
 from app.config import settings
+from app.risk.portfolio_exposure import evaluate_symbol_exposure
 
 PAPER_ORDER_PLACEMENT_ENABLED = os.getenv("PAPER_ORDER_PLACEMENT_ENABLED", "false").lower() == "true"
 PAPER_AUTO_TRADING_ENABLED = os.getenv("PAPER_AUTO_TRADING_ENABLED", "false").lower() == "true"
@@ -144,14 +145,22 @@ def _validate_signal(result: dict[str, Any], opportunity: dict[str, Any], timefr
     return direction, symbol
 
 
+def _exposure_check(symbol: str, side: str) -> dict[str, Any]:
+    try:
+        positions = _ib_connected().positions()
+    except Exception as exc:
+        return {"approved": False, "reason": f"DATA UNAVAILABLE: broker positions could not be verified: {exc}", "status": "DATA UNAVAILABLE"}
+    return evaluate_symbol_exposure(symbol, side, positions, allow_opposing=False)
+
+
 def _current_open() -> bool:
     with _LOCK: return _RECORD is not None and _RECORD.closed_at_utc is None and _RECORD.status not in {"Cancelled", "Inactive", "ApiCancelled", "Closed"}
 
 
 def controlled_test_preview(symbol: str = "EUR/USD", timeframe: str = "15m") -> dict[str, Any]:
     if not PAPER_ORDER_PLACEMENT_ENABLED: return {"status": "LOCKED", "reason": "PAPER_ORDER_PLACEMENT_ENABLED=false", "execution_authorized": False}
-    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized)
-    return {"status": "PAPER_PREVIEW", "preview_type": "TIMEFRAME_SIGNAL_AND_CONTRACT_GATE_CHECK", "symbol": normalized, "timeframe": timeframe, "side": side, "strategy_id": opportunity.get("strategy_id"), "signal_id": opportunity.get("signal_id"), "quantity": TEST_QUANTITY, "broker_contract": {"con_id": int(getattr(contract, "conId", 0) or 0), "local_symbol": getattr(contract, "localSymbol", None), "exchange": getattr(contract, "exchange", None), "currency": getattr(contract, "currency", None)}, "risk": {"approved": False, "reason": "PAPER_ONLY_EXECUTION_LOCK"}, "execution_authorized": False, "paper_only": True, "signal": {"prediction": opportunity.get("prediction"), "probability_up": opportunity.get("probability_up"), "probability_down": opportunity.get("probability_down"), "entry_signal": opportunity.get("entry_signal"), "entry_status": opportunity.get("entry_status"), "entry_reason": opportunity.get("entry_reason"), "context": opportunity.get("context"), "reference_price": opportunity.get("reference_price"), "stop_loss": opportunity.get("stop_loss"), "take_profit": opportunity.get("take_profit")}}
+    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
+    return {"status": "PAPER_PREVIEW" if exposure.get("approved") else "BLOCKED", "preview_type": "TIMEFRAME_SIGNAL_AND_CONTRACT_GATE_CHECK", "symbol": normalized, "timeframe": timeframe, "side": side, "strategy_id": opportunity.get("strategy_id"), "signal_id": opportunity.get("signal_id"), "quantity": TEST_QUANTITY, "broker_contract": {"con_id": int(getattr(contract, "conId", 0) or 0), "local_symbol": getattr(contract, "localSymbol", None), "exchange": getattr(contract, "exchange", None), "currency": getattr(contract, "currency", None)}, "portfolio_exposure": exposure, "risk": {"approved": False, "reason": "PAPER_ONLY_EXECUTION_LOCK"}, "execution_authorized": False, "paper_only": True, "signal": {"prediction": opportunity.get("prediction"), "probability_up": opportunity.get("probability_up"), "probability_down": opportunity.get("probability_down"), "entry_signal": opportunity.get("entry_signal"), "entry_status": opportunity.get("entry_status"), "entry_reason": opportunity.get("entry_reason"), "context": opportunity.get("context"), "reference_price": opportunity.get("reference_price"), "stop_loss": opportunity.get("stop_loss"), "take_profit": opportunity.get("take_profit")}}
 
 
 def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> dict[str, Any]:
@@ -159,7 +168,8 @@ def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> di
     _require_paper_order_mode(); _init_db()
     with _LOCK:
         if _current_open(): raise RuntimeError("PAPER TEST BLOCKED: a controlled test order is already active.")
-    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized)
+    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
+    if not exposure.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: portfolio exposure gate: {exposure.get('reason')}")
     ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; order = ibi.MarketOrder(side, TEST_QUANTITY); order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
     record = OrderRecord(client_order_id, int(getattr(order, "orderId", 0) or 0), normalized, side, TEST_QUANTITY, str(getattr(trade.orderStatus, "status", "Submitted")), 0.0, None, str(opportunity.get("signal_id") or "") or None, str(opportunity.get("strategy_id") or "forex-mtf-paper-test-v1"), _now())
     _TRADE, _RECORD = trade, record; _save_record(record); _ib_connected().sleep(2); return _order_snapshot(trade, record)
@@ -201,7 +211,9 @@ def _auto_tick() -> None:
     if selected is None: return
     result, opportunity = selected; side = str(opportunity.get("prediction") or "").upper()
     if side not in {"LONG", "SHORT"}: return
-    normalized, contract = _qualify(str(result.get("instrument") or "")); ibi = _library(); order = ibi.MarketOrder(side, AUTO_QUANTITY); client_order_id = f"paper-auto-{uuid4().hex}"; order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
+    normalized, contract = _qualify(str(result.get("instrument") or "")); exposure = _exposure_check(normalized, side)
+    if not exposure.get("approved"): return
+    ibi = _library(); order = ibi.MarketOrder(side, AUTO_QUANTITY); client_order_id = f"paper-auto-{uuid4().hex}"; order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
     global _TRADE, _RECORD
     with _LOCK:
         _TRADE, _RECORD = trade, OrderRecord(client_order_id, int(getattr(order, "orderId", 0) or 0), normalized, side, AUTO_QUANTITY, str(getattr(trade.orderStatus, "status", "Submitted")), 0.0, None, str(opportunity.get("signal_id") or "") or None, str(opportunity.get("strategy_id") or "forex-mtf-paper-auto-v1"), _now()); _save_record(_RECORD)
