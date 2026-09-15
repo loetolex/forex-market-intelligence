@@ -242,23 +242,33 @@ def _current_open() -> bool:
 
 
 def controlled_test_preview(signal: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate the controlled EUR/USD paper order without a blocking what-if request.
+
+    IBKR ``whatIfOrder`` can hang in some paper/demo configurations while waiting
+    for an account/margin response. The controlled preview therefore performs
+    only deterministic signal gates plus broker contract qualification. Actual
+    broker submission remains a separate explicit step.
+    """
     if not PAPER_ORDER_PLACEMENT_ENABLED:
         return {"status": "LOCKED", "reason": "PAPER_ORDER_PLACEMENT_ENABLED=false", "execution_authorized": False}
     signal = signal or _fetch_eurusd_signal()
     side, symbol = _validate_signal(signal)
     normalized, contract = _qualify(symbol)
-    ibi = _library()
-    order = ibi.MarketOrder(side, TEST_QUANTITY)
-    order.orderRef = f"TEST-{uuid4().hex[:12]}"
-    state = _ib_connected().whatIfOrder(contract, order)
     return {
         "status": "PAPER_PREVIEW",
+        "preview_type": "CONTRACT_AND_GATE_CHECK",
         "symbol": normalized,
         "side": side,
         "quantity": TEST_QUANTITY,
-        "margin_change": getattr(state, "initMarginChange", None),
-        "commission": getattr(state, "commission", None),
-        "warning_text": getattr(state, "warningText", ""),
+        "broker_contract": {
+            "con_id": int(getattr(contract, "conId", 0) or 0),
+            "local_symbol": getattr(contract, "localSymbol", None),
+            "exchange": getattr(contract, "exchange", None),
+            "currency": getattr(contract, "currency", None),
+        },
+        "margin_change": None,
+        "commission": None,
+        "warning_text": "WHAT_IF_DISABLED_FOR_CONTROLLED_TEST_TO_PREVENT_PAPER_DEMO_HANGS",
         "execution_authorized": False,
         "paper_only": True,
         "signal": {
