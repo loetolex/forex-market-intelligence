@@ -8,7 +8,7 @@ from app.config import settings
 from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series, inspect_time_series as inspect_tiingo_time_series
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_readonly import read_only_status
-from app.services.pipeline import normalize_symbol, run_market_cycle
+from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
 
 app = FastAPI(
     title="Forex Market Intelligence",
@@ -45,6 +45,14 @@ def health():
     }
 
 
+@app.get("/learning/status")
+def learning_status():
+    """Read-only diagnostics for shadow RL learning and baseline comparison."""
+    if not settings.rl_enabled or not settings.rl_shadow_only:
+        return {"status": "DISABLED", "advisory_only": True, "execution_authorized": False}
+    return get_shadow_learning_status()
+
+
 @app.get("/provider/inspect/{symbol}")
 def provider_inspect(
     symbol: str,
@@ -53,13 +61,9 @@ def provider_inspect(
 ):
     """Diagnostic-only endpoint for one Tiingo request."""
     if interval not in settings.forecast_intervals:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Supported intervals: {settings.forecast_intervals}",
-        )
+        raise HTTPException(status_code=400, detail=f"Supported intervals: {settings.forecast_intervals}")
     if outputsize < 1 or outputsize > 100:
         raise HTTPException(status_code=400, detail="outputsize must be between 1 and 100.")
-
     try:
         return inspect_tiingo_time_series(
             settings.tiingo_api_token,
@@ -81,10 +85,7 @@ def provider_crosscheck(
     This endpoint is diagnostic only. A disagreement never authorizes trading.
     """
     if interval not in settings.forecast_intervals:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Supported intervals: {settings.forecast_intervals}",
-        )
+        raise HTTPException(status_code=400, detail=f"Supported intervals: {settings.forecast_intervals}")
     if outputsize < 2 or outputsize > 100:
         raise HTTPException(status_code=400, detail="outputsize must be between 2 and 100.")
     if not settings.tiingo_api_token:
@@ -93,7 +94,6 @@ def provider_crosscheck(
         raise HTTPException(status_code=503, detail="DATA UNAVAILABLE: TWELVE_DATA_API_KEY is not configured.")
 
     normalized = normalize_symbol(symbol)
-
     try:
         history_days = 30 if interval in {"15m", "30m", "1h"} else 120
         tiingo = fetch_tiingo_time_series(
@@ -109,12 +109,10 @@ def provider_crosscheck(
             interval=interval,
             outputsize=outputsize,
         )
-
         tiingo_last = tiingo.iloc[-1]
         twelve_last = twelve.iloc[-1]
         tiingo_last_ts = pd.to_datetime(tiingo_last["timestamp"], utc=True)
         twelve_last_ts = pd.to_datetime(twelve_last["timestamp"], utc=True)
-
         return {
             "status": "CALCULATED",
             "symbol": normalized,
@@ -163,14 +161,11 @@ def market(symbol: str, interval: str | None = None):
 
 
 @app.get("/portfolio")
-def portfolio(
-    symbols: list[str] = Query(default=DEFAULT_PAIRS),
-):
+def portfolio(symbols: list[str] = Query(default=DEFAULT_PAIRS)):
     if not symbols:
         raise HTTPException(status_code=400, detail="At least one symbol is required.")
     if len(symbols) > len(DEFAULT_PAIRS):
         raise HTTPException(status_code=400, detail=f"Maximum {len(DEFAULT_PAIRS)} pairs per portfolio request in this stage.")
-
     results = []
     for raw_symbol in symbols:
         symbol = normalize_symbol(raw_symbol)
@@ -183,7 +178,6 @@ def portfolio(
                 "error": str(exc),
                 "execution_authorized": False,
             })
-
     usable = [r for r in results if r.get("status") not in {"DATA UNAVAILABLE", "NOT_ADMITTED"}]
     return {
         "status": "MODEL OUTPUT" if usable else "DATA UNAVAILABLE",
