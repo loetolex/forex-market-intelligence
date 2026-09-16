@@ -31,15 +31,18 @@ def isolated_scanner_state(monkeypatch):
 
 def test_portfolio_request_reserves_worker_and_polls_without_duplicates(monkeypatch):
     release = Event()
+    started = Event()
     calls: list[str] = []
 
     def fake_scan(symbol: str):
         calls.append(symbol)
+        started.set()
         release.wait(timeout=2)
         return {"instrument": symbol, "status": "MODEL OUTPUT", "execution_authorized": False}
 
     monkeypatch.setattr(scanner, "_scan_pair", fake_scan)
     first = scanner.request_portfolio_scan(["EUR/USD"])
+    assert started.wait(timeout=1)
     second = scanner.request_portfolio_scan(["EUR/USD"])
     status = scanner.get_portfolio_status()
 
@@ -93,15 +96,17 @@ def test_all_twelve_pairs_complete_and_refresh_restarts_once(monkeypatch):
 
 
 def test_closed_candle_freshness_and_complete_aggregation():
-    now = pd.Timestamp.now(tz="UTC").floor("15min")
-    timestamps = [now - pd.Timedelta(minutes=30), now - pd.Timedelta(minutes=15), now]
+    # Anchor the synthetic 15m bars to a 30m boundary so two consecutive
+    # closed 15m bars form exactly one complete 30m candle.
+    now = pd.Timestamp.now(tz="UTC").floor("30min")
+    timestamps = [now - pd.Timedelta(minutes=45), now - pd.Timedelta(minutes=30), now - pd.Timedelta(minutes=15)]
     frame = pd.DataFrame({
         "timestamp": timestamps, "open": [1.0, 1.0, 1.0], "high": [1.1, 1.1, 1.1],
         "low": [0.9, 0.9, 0.9], "close": [1.0, 1.0, 1.0], "provider": "test",
         "instrument": "EUR/USD", "timeframe": "15m", "data_status": "REAL_DATA",
     })
     closed = keep_closed_candles(frame, "15m")
-    assert len(closed) == 2
+    assert len(closed) == 3
     aggregated = aggregate_from_frame(closed, "30min", "30m", expected_bars=2)
     assert len(aggregated) == 1
     validate_freshness(aggregated, 90, "30m")
