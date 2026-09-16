@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import threading
@@ -12,6 +13,7 @@ from uuid import uuid4
 import httpx
 
 from app.config import settings
+from app.risk.gate import evaluate_signal
 from app.risk.portfolio_exposure import evaluate_symbol_exposure
 
 PAPER_ORDER_PLACEMENT_ENABLED = os.getenv("PAPER_ORDER_PLACEMENT_ENABLED", "false").lower() == "true"
@@ -113,7 +115,7 @@ def _order_snapshot(trade: Any, record: OrderRecord, broker_diagnostics: dict[st
     status = getattr(trade.orderStatus, "status", "UNKNOWN"); filled = float(getattr(trade.orderStatus, "filled", 0.0) or 0.0); avg = getattr(trade.orderStatus, "avgFillPrice", None); avg_float = float(avg) if avg not in (None, 0, 0.0) else None
     record.status, record.filled, record.avg_fill_price = status, filled, avg_float
     if status in {"Filled", "PartiallyFilled"}: _save_record(record)
-    return {"status": "REAL_BROKER_DATA", "broker": "INTERACTIVE_BROKERS", "order": {"client_order_id": record.client_order_id, "broker_order_id": record.broker_order_id, "symbol": record.symbol, "side": record.side, "quantity": record.quantity, "order_status": status, "filled": filled, "remaining": float(getattr(trade.orderStatus, "remaining", 0.0) or 0.0), "avg_fill_price": avg_float, "signal_id": record.signal_id, "strategy_id": record.strategy_id}, "broker_diagnostics": broker_diagnostics or _broker_diagnostics(trade), "execution_authorized": False, "paper_only": True}
+    return {"status": "REAL_BROKER_DATA", "broker": "INTERACTIVE_BROKERS", "order": {"client_order_id": record.client_order_id, "broker_order_id": record.broker_order_id, "symbol": record.symbol, "side": record.side, "quantity": record.quantity, "order_status": status, "filled": filled, "remaining": float(getattr(trade.orderStatus, "remaining", 0.0) or 0.0), "avg_fill_price": avg_float, "signal_id": record.signal_id, "strategy_id": record.strategy_id}, "broker_diagnostics": broker_diagnostics or _broker_diagnostics(trade), "execution_authorized": True, "paper_only": True}
 
 
 def _portfolio_results() -> dict[str, Any]:
@@ -133,34 +135,37 @@ def _fetch_timeframe_signal(symbol: str = "EUR/USD", timeframe: str = "15m") -> 
     if timeframe not in SUPPORTED_TIMEFRAMES: raise RuntimeError(f"PAPER TEST BLOCKED: unsupported timeframe {timeframe}.")
     try:
         found = _find_result(_portfolio_results(), symbol, timeframe)
-        if found is not None: return found["result"], found["opportunity"]
-        initial_error = f"{symbol} {timeframe} is not present in the current portfolio snapshot."
-    except Exception as exc: initial_error = str(exc)
+    except Exception as exc:
+        raise RuntimeError(f"DATA UNAVAILABLE: portfolio results could not be read: {exc}") from exc
+    if found is None:
+        raise RuntimeError(f"DATA UNAVAILABLE: completed portfolio snapshot does not contain {symbol} {timeframe}; refresh the portfolio scan explicitly before retrying.")
+    return found["result"], found["opportunity"]
+
+
+def _validate_exit_framework(opportunity: dict[str, Any], timeframe: str) -> dict[str, Any]:
+    framework = opportunity.get("exit_framework") or {}
+    if framework.get("status") != "CALCULATED":
+        return {"approved": False, "reason": f"{timeframe} exit framework is {framework.get('status') or 'DATA UNAVAILABLE'}.", "status": "DATA UNAVAILABLE"}
     try:
-        response = httpx.get(f"{FOREX_API_URL}/portfolio", params={"refresh": "true"}, timeout=25.0); response.raise_for_status()
-    except Exception as exc: raise RuntimeError(f"DATA UNAVAILABLE: unable to start portfolio refresh: {exc}") from exc
-    deadline = time.monotonic() + PORTFOLIO_REFRESH_TIMEOUT_SECONDS; last_status = "UNKNOWN"
-    while time.monotonic() < deadline:
-        try:
-            status_response = httpx.get(f"{FOREX_API_URL}/portfolio/status", timeout=10.0); status_response.raise_for_status(); payload = status_response.json(); last_status = str(payload.get("status") or "UNKNOWN").upper()
-        except Exception as exc: raise RuntimeError(f"DATA UNAVAILABLE: portfolio status could not be read: {exc}") from exc
-        if last_status == "COMPLETE":
-            found = _find_result(_portfolio_results(), symbol, timeframe)
-            if found is not None: return found["result"], found["opportunity"]
-            raise RuntimeError(f"DATA UNAVAILABLE: completed portfolio scan without {symbol} {timeframe} result.")
-        if last_status in {"FAILED", "ERROR"}: raise RuntimeError(f"DATA UNAVAILABLE: portfolio scan failed: {payload.get('last_error') or 'scanner reported failure'}")
-        time.sleep(PORTFOLIO_REFRESH_POLL_SECONDS)
-    raise RuntimeError(f"DATA UNAVAILABLE: portfolio refresh timed out after {PORTFOLIO_REFRESH_TIMEOUT_SECONDS}s (last_status={last_status}, initial={initial_error}).")
+        entry = float(opportunity.get("reference_price")); stop = float(opportunity.get("stop_loss")); target = float(opportunity.get("take_profit"))
+    except (TypeError, ValueError):
+        return {"approved": False, "reason": f"{timeframe} entry/stop/target levels are DATA UNAVAILABLE.", "status": "DATA UNAVAILABLE"}
+    if not all(math.isfinite(value) and value > 0 for value in (entry, stop, target)):
+        return {"approved": False, "reason": f"{timeframe} entry/stop/target levels are INVALID.", "status": "CALCULATED"}
+    side = str(opportunity.get("prediction") or "").upper()
+    if side == "LONG" and not (stop < entry < target):
+        return {"approved": False, "reason": f"{timeframe} LONG exit geometry is invalid.", "status": "CALCULATED"}
+    if side == "SHORT" and not (target < entry < stop):
+        return {"approved": False, "reason": f"{timeframe} SHORT exit geometry is invalid.", "status": "CALCULATED"}
+    risk_distance = abs(entry - stop); reward_distance = abs(target - entry)
+    if risk_distance <= 0 or reward_distance <= 0:
+        return {"approved": False, "reason": f"{timeframe} stop/target distances are INVALID.", "status": "CALCULATED"}
+    return {"approved": True, "reason": "EXIT_FRAMEWORK_VALID", "status": "CALCULATED", "reference_price": entry, "stop_loss": stop, "take_profit": target, "risk_reward": reward_distance / risk_distance, "holding_horizon": opportunity.get("holding_horizon"), "method": framework.get("method")}
 
 
-def _validate_signal(result: dict[str, Any], opportunity: dict[str, Any], timeframe: str) -> tuple[str, str]:
-    symbol = str(result.get("instrument") or "").upper(); direction = str(opportunity.get("prediction") or "UNKNOWN").upper()
-    if symbol != "EUR/USD": raise RuntimeError("PAPER TEST BLOCKED: controlled test is restricted to EUR/USD.")
-    if opportunity.get("status") != "MODEL OUTPUT" or opportunity.get("data_status") != "REAL_DATA": raise RuntimeError("PAPER TEST BLOCKED: selected timeframe model output is unavailable.")
-    if direction not in {"LONG", "SHORT"}: raise RuntimeError("PAPER TEST BLOCKED: selected timeframe is not directional.")
-    if not bool(opportunity.get("entry_signal")): raise RuntimeError(f"PAPER TEST BLOCKED: {timeframe} entry signal is not active: {opportunity.get('entry_reason') or 'NO TRADE'}.")
-    if opportunity.get("exit_framework", {}).get("status") != "CALCULATED": raise RuntimeError(f"PAPER TEST BLOCKED: {timeframe} exit levels are DATA UNAVAILABLE.")
-    return direction, symbol
+def _risk_check(opportunity: dict[str, Any]) -> dict[str, Any]:
+    decision = evaluate_signal(opportunity.get("probability_up"))
+    return {"approved": decision.approved, "reason": decision.reason, "status": "CALCULATED"}
 
 
 def _exposure_check(symbol: str, side: str) -> dict[str, Any]:
@@ -171,14 +176,34 @@ def _exposure_check(symbol: str, side: str) -> dict[str, Any]:
     return evaluate_symbol_exposure(symbol, side, positions, allow_opposing=False)
 
 
+def _execution_gate(risk: dict[str, Any], exposure: dict[str, Any], exit_framework: dict[str, Any]) -> dict[str, Any]:
+    if str(settings.trading_mode).upper() != "PAPER": return {"approved": False, "reason": "BROKER SAFETY: trading_mode must be PAPER."}
+    if bool(settings.live_trading_enabled): return {"approved": False, "reason": "BROKER SAFETY: live_trading_enabled must remain false."}
+    if not PAPER_ORDER_PLACEMENT_ENABLED: return {"approved": False, "reason": "PAPER_ORDER_PLACEMENT_ENABLED=false"}
+    if not risk.get("approved"): return {"approved": False, "reason": f"RISK_GATE: {risk.get('reason')}"}
+    if not exit_framework.get("approved"): return {"approved": False, "reason": f"EXIT_GATE: {exit_framework.get('reason')}"}
+    if not exposure.get("approved"): return {"approved": False, "reason": f"EXPOSURE_GATE: {exposure.get('reason')}"}
+    return {"approved": True, "reason": "ALL_PAPER_EXECUTION_GATES_PASSED"}
+
+
 def _current_open() -> bool:
     with _LOCK: return _RECORD is not None and _RECORD.closed_at_utc is None and _RECORD.status not in {"Cancelled", "Inactive", "ApiCancelled", "Closed"}
 
 
+def _validate_signal(result: dict[str, Any], opportunity: dict[str, Any], timeframe: str) -> tuple[str, str, dict[str, Any]]:
+    symbol = str(result.get("instrument") or "").upper(); direction = str(opportunity.get("prediction") or "UNKNOWN").upper()
+    if opportunity.get("status") != "MODEL OUTPUT" or opportunity.get("data_status") != "REAL_DATA": raise RuntimeError("PAPER TEST BLOCKED: selected timeframe model output is unavailable.")
+    if direction not in {"LONG", "SHORT"}: raise RuntimeError("PAPER TEST BLOCKED: selected timeframe is not directional.")
+    if not bool(opportunity.get("entry_signal")): raise RuntimeError(f"PAPER TEST BLOCKED: {timeframe} entry signal is not active: {opportunity.get('entry_reason') or 'NO TRADE'}.")
+    exit_framework = _validate_exit_framework(opportunity, timeframe)
+    if not exit_framework.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: {exit_framework.get('reason')}")
+    return direction, symbol, exit_framework
+
+
 def controlled_test_preview(symbol: str = "EUR/USD", timeframe: str = "15m") -> dict[str, Any]:
     if not PAPER_ORDER_PLACEMENT_ENABLED: return {"status": "LOCKED", "reason": "PAPER_ORDER_PLACEMENT_ENABLED=false", "execution_authorized": False}
-    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
-    return {"status": "PAPER_PREVIEW" if exposure.get("approved") else "BLOCKED", "preview_type": "TIMEFRAME_SIGNAL_AND_CONTRACT_GATE_CHECK", "symbol": normalized, "timeframe": timeframe, "side": side, "strategy_id": opportunity.get("strategy_id"), "signal_id": opportunity.get("signal_id"), "quantity": TEST_QUANTITY, "broker_contract": {"con_id": int(getattr(contract, "conId", 0) or 0), "local_symbol": getattr(contract, "localSymbol", None), "exchange": getattr(contract, "exchange", None), "currency": getattr(contract, "currency", None)}, "portfolio_exposure": exposure, "risk": {"approved": False, "reason": "PAPER_ONLY_EXECUTION_LOCK"}, "execution_authorized": False, "paper_only": True, "signal": {"prediction": opportunity.get("prediction"), "probability_up": opportunity.get("probability_up"), "probability_down": opportunity.get("probability_down"), "entry_signal": opportunity.get("entry_signal"), "entry_status": opportunity.get("entry_status"), "entry_reason": opportunity.get("entry_reason"), "context": opportunity.get("context"), "reference_price": opportunity.get("reference_price"), "stop_loss": opportunity.get("stop_loss"), "take_profit": opportunity.get("take_profit")}}
+    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized, exit_framework = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); risk = _risk_check(opportunity); exposure = _exposure_check(normalized, side); execution = _execution_gate(risk, exposure, exit_framework)
+    return {"status": "PAPER_PREVIEW" if execution.get("approved") else "BLOCKED", "preview_type": "TIMEFRAME_SIGNAL_RISK_EXIT_CONTRACT_EXPOSURE_GATE_CHECK", "symbol": normalized, "timeframe": timeframe, "side": side, "strategy_id": opportunity.get("strategy_id"), "signal_id": opportunity.get("signal_id"), "quantity": TEST_QUANTITY, "broker_contract": {"con_id": int(getattr(contract, "conId", 0) or 0), "local_symbol": getattr(contract, "localSymbol", None), "exchange": getattr(contract, "exchange", None), "currency": getattr(contract, "currency", None)}, "portfolio_exposure": exposure, "risk": risk, "exit_framework": exit_framework, "execution_gate": execution, "execution_authorized": bool(execution.get("approved")), "paper_only": True, "signal": {"prediction": opportunity.get("prediction"), "probability_up": opportunity.get("probability_up"), "probability_down": opportunity.get("probability_down"), "entry_signal": opportunity.get("entry_signal"), "entry_status": opportunity.get("entry_status"), "entry_reason": opportunity.get("entry_reason"), "context": opportunity.get("context"), "reference_price": opportunity.get("reference_price"), "stop_loss": opportunity.get("stop_loss"), "take_profit": opportunity.get("take_profit")}}
 
 
 def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> dict[str, Any]:
@@ -186,8 +211,8 @@ def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> di
     _require_paper_order_mode(); _init_db()
     with _LOCK:
         if _current_open(): raise RuntimeError("PAPER TEST BLOCKED: a controlled test order is already active.")
-    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); exposure = _exposure_check(normalized, side)
-    if not exposure.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: portfolio exposure gate: {exposure.get('reason')}")
+    result, opportunity = _fetch_timeframe_signal(symbol, timeframe); side, normalized, exit_framework = _validate_signal(result, opportunity, timeframe); _, contract = _qualify(normalized); risk = _risk_check(opportunity); exposure = _exposure_check(normalized, side); execution = _execution_gate(risk, exposure, exit_framework)
+    if not execution.get("approved"): raise RuntimeError(f"PAPER TEST BLOCKED: {execution.get('reason')}")
     ibi = _library(); client_order_id = f"paper-test-{uuid4().hex}"; broker_action = "BUY" if side == "LONG" else "SELL"; order = ibi.MarketOrder(broker_action, TEST_QUANTITY); order.orderRef = client_order_id
     ib = _ib_connected(); captured_errors: list[dict[str, Any]] = []
     def _capture_error(req_id: Any, error_code: Any, error_string: Any, contract_obj: Any) -> None:
@@ -200,7 +225,7 @@ def place_controlled_test(symbol: str = "EUR/USD", timeframe: str = "15m") -> di
     finally:
         try: ib.errorEvent -= _capture_error
         except Exception: pass
-    return _order_snapshot(trade, record, _broker_diagnostics(trade, captured_errors))
+    snapshot = _order_snapshot(trade, record, _broker_diagnostics(trade, captured_errors)); snapshot["risk"] = risk; snapshot["exit_framework"] = exit_framework; snapshot["execution_gate"] = execution; return snapshot
 
 
 def order_status() -> dict[str, Any]:
@@ -228,7 +253,9 @@ def _select_auto_signal() -> tuple[dict[str, Any], dict[str, Any]] | None:
     payload = _portfolio_results(); candidates = []
     for result in payload.get("results") or []:
         for timeframe, opportunity in (result.get("timeframe_opportunities") or {}).items():
-            if opportunity.get("status") == "MODEL OUTPUT" and opportunity.get("data_status") == "REAL_DATA" and opportunity.get("entry_signal"): candidates.append((result, opportunity))
+            if opportunity.get("status") == "MODEL OUTPUT" and opportunity.get("data_status") == "REAL_DATA" and opportunity.get("entry_signal"):
+                risk = _risk_check(opportunity); exit_framework = _validate_exit_framework(opportunity, timeframe)
+                if risk.get("approved") and exit_framework.get("approved"): candidates.append((result, opportunity))
     if not candidates: return None
     candidates.sort(key=lambda item: float(item[1].get("confidence") or 0.0), reverse=True); return candidates[0]
 
@@ -237,10 +264,12 @@ def _auto_tick() -> None:
     if not PAPER_AUTO_TRADING_ENABLED or not PAPER_ORDER_PLACEMENT_ENABLED or _current_open(): return
     selected = _select_auto_signal()
     if selected is None: return
-    result, opportunity = selected; side = str(opportunity.get("prediction") or "").upper()
+    result, opportunity = selected; side = str(opportunity.get("prediction") or "").upper(); timeframe = str(opportunity.get("timeframe") or "15m")
     if side not in {"LONG", "SHORT"}: return
-    normalized, contract = _qualify(str(result.get("instrument") or "")); exposure = _exposure_check(normalized, side)
-    if not exposure.get("approved"): return
+    exit_framework = _validate_exit_framework(opportunity, timeframe); risk = _risk_check(opportunity)
+    if not exit_framework.get("approved") or not risk.get("approved"): return
+    normalized, contract = _qualify(str(result.get("instrument") or "")); exposure = _exposure_check(normalized, side); execution = _execution_gate(risk, exposure, exit_framework)
+    if not execution.get("approved"): return
     ibi = _library(); broker_action = "BUY" if side == "LONG" else "SELL"; order = ibi.MarketOrder(broker_action, AUTO_QUANTITY); client_order_id = f"paper-auto-{uuid4().hex}"; order.orderRef = client_order_id; trade = _ib_connected().placeOrder(contract, order)
     global _TRADE, _RECORD
     with _LOCK:
