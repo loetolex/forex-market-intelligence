@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     tiingo_daily_history_days: int = 1095
     tiingo_cache_ttl_seconds: int = 300
 
+    # Tiingo request protection shared by portfolio scanning and deep analysis.
+    tiingo_requests_per_minute: int = 10
+    tiingo_max_429_retries: int = 1
+    tiingo_retry_wait_seconds: int = 60
+
     # Canonical FX trading-day boundary for session validation/reporting.
     # Tiingo's documented FX market hours close at 5pm New York time.
     fx_daily_boundary_timezone: str = "America/New_York"
