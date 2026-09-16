@@ -9,7 +9,7 @@ def test_risk_approval_never_authorizes_orders():
 
     # Risk approval is intentionally not execution authorization. Broker
     # submission remains behind the paper execution gate in paper_trading.py.
-    assert decision.approved is not None
+    assert not hasattr(decision, "execution_authorized")
 
 
 def test_missing_risk_data_is_rejected():
