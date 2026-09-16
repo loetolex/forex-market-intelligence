@@ -88,14 +88,6 @@ def paper_config():
     return paper_configuration_status()
 
 
-@app.get("/paper/preview/{symbol}")
-def paper_preview(symbol: str, timeframe: str = "15m"):
-    try:
-        return controlled_test_preview(normalize_symbol(symbol), timeframe)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-
 @app.post("/paper/controlled-test/{symbol}")
 def paper_controlled_test(symbol: str, timeframe: str = "15m"):
     try:
@@ -113,6 +105,28 @@ def paper_status():
 def paper_close_controlled_test():
     try:
         return close_controlled_test()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/paper/preview/{symbol:path}")
+def paper_preview(symbol: str, timeframe: str = "15m"):
+    """Preview a paper execution contract without authorizing broker execution.
+
+    The path converter intentionally accepts encoded FX separators such as
+    ``EUR%2FUSD`` after URL decoding. Fixed paper routes are registered first
+    so this catch-all symbol route cannot shadow ``/paper/order-status`` or
+    ``/paper/close-controlled-test``.
+    """
+    try:
+        result = controlled_test_preview(normalize_symbol(symbol), timeframe)
+        # A preview may report that all pre-trade gates pass, but previewing
+        # never authorizes execution. Actual authorization requires the
+        # controlled execution path to submit and reconcile broker state.
+        result["execution_authorized"] = False
+        result["execution_status"] = "PREVIEW_ONLY"
+        result["preview_only"] = True
+        return result
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
