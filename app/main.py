@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
@@ -9,6 +11,14 @@ from app.data.tiingo_fx import fetch_time_series as fetch_tiingo_time_series, in
 from app.data.twelve_data import fetch_time_series as fetch_twelve_time_series
 from app.execution.ibkr_bridge_client import IBKRBridgeUnavailable, get_status as get_ibkr_bridge_status
 from app.execution.ibkr_readonly import read_only_status
+from app.paper_trading import (
+    close_controlled_test,
+    configuration_status as paper_configuration_status,
+    controlled_test_preview,
+    order_status as paper_order_status,
+    place_controlled_test,
+    start_auto_trader,
+)
 from app.services.pipeline import get_shadow_learning_status, normalize_symbol, run_market_cycle
 from app.services.portfolio_scanner import (
     DEFAULT_PORTFOLIO_PAIRS,
@@ -19,21 +29,34 @@ from app.services.portfolio_scanner import (
     request_portfolio_scan,
 )
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Automatic trading can start only when the explicit PAPER controls are
+    # enabled. The paper trader itself enforces trading_mode=PAPER and
+    # live_trading_enabled=false before any broker submission.
+    start_auto_trader()
+    yield
+
+
 app = FastAPI(
     title="Forex Market Intelligence",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 
 @app.get("/health")
 def health():
+    paper = paper_configuration_status()
     return {
         "status": "ok",
         "service": "forex-market-intelligence",
         "mode": settings.trading_mode,
         "live_trading_enabled": settings.live_trading_enabled,
         "order_placement_enabled": settings.order_placement_enabled,
-        "paper_order_placement_enabled": settings.paper_order_placement_enabled,
+        "paper_order_placement_enabled": paper["paper_order_placement_enabled"],
+        "paper_auto_trading_enabled": paper["paper_auto_trading_enabled"],
         "market_data": {
             "primary": settings.market_data_provider,
             "secondary": settings.secondary_market_data_provider,
@@ -53,9 +76,45 @@ def health():
             "forecast_can_place_orders": False,
             "rl_can_authorize_execution": False,
             "live_execution": "LOCKED",
-            "paper_submission": "LOCKED",
+            "paper_submission": "ENABLED" if paper["paper_order_placement_enabled"] else "LOCKED",
+            "automatic_paper_trading": "ENABLED" if paper["paper_auto_trading_enabled"] else "LOCKED",
+            "protective_exits": paper["protective_exits"],
         },
     }
+
+
+@app.get("/paper/config")
+def paper_config():
+    return paper_configuration_status()
+
+
+@app.get("/paper/preview/{symbol}")
+def paper_preview(symbol: str, timeframe: str = "15m"):
+    try:
+        return controlled_test_preview(normalize_symbol(symbol), timeframe)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/paper/controlled-test/{symbol}")
+def paper_controlled_test(symbol: str, timeframe: str = "15m"):
+    try:
+        return place_controlled_test(normalize_symbol(symbol), timeframe)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/paper/order-status")
+def paper_status():
+    return paper_order_status()
+
+
+@app.post("/paper/close-controlled-test")
+def paper_close_controlled_test():
+    try:
+        return close_controlled_test()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/learning/status")
@@ -199,35 +258,27 @@ def portfolio(
 
 @app.get("/portfolio/status")
 def portfolio_status():
-    """Read portfolio scan progress without initiating a scan."""
     return get_portfolio_status()
 
 
 @app.get("/portfolio/results")
 def portfolio_results():
-    """Read compact portfolio results without initiating a scan."""
     return get_portfolio_results()
 
 
 @app.get("/portfolio/ranking")
 def portfolio_ranking():
-    """Read the deterministic all-pair ranking without initiating a scan."""
     return get_portfolio_ranking()
 
 
 @app.get("/portfolio/candidates")
 def portfolio_candidates():
-    """Read selected deep-analysis candidates without initiating a scan."""
     return get_portfolio_candidates()
 
 
 @app.get("/ibkr/bridge-status")
 def ibkr_bridge_status():
-    """Safe Railway-side connectivity diagnostic for the local IBKR bridge.
-
-    Returns only non-secret bridge/broker state. Credentials, URLs, and tokens
-    are never returned, and this endpoint cannot place or preview an order.
-    """
+    """Safe Railway-side connectivity diagnostic for the IBKR bridge."""
     if not settings.ibkr_bridge_url:
         return {
             "status": "DATA UNAVAILABLE",
