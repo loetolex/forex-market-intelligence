@@ -1,0 +1,13 @@
+name: Actions Smoke Diagnostic
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Actions runner startup
+        run: echo "GitHub Actions runner started successfully"
