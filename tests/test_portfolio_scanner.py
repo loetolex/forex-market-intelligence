@@ -96,10 +96,11 @@ def test_all_twelve_pairs_complete_and_refresh_restarts_once(monkeypatch):
 
 
 def test_closed_candle_freshness_and_complete_aggregation():
-    # Anchor the synthetic 15m bars to a 30m boundary so two consecutive
-    # closed 15m bars form exactly one complete 30m candle.
+    # Anchor the synthetic 15m bars to a 30m boundary. The first two
+    # timestamps form one complete 30m bucket; the latest closed source bar
+    # is intentionally in the following bucket and is not enough to aggregate.
     now = pd.Timestamp.now(tz="UTC").floor("30min")
-    timestamps = [now - pd.Timedelta(minutes=45), now - pd.Timedelta(minutes=30), now - pd.Timedelta(minutes=15)]
+    timestamps = [now - pd.Timedelta(minutes=60), now - pd.Timedelta(minutes=45), now - pd.Timedelta(minutes=30)]
     frame = pd.DataFrame({
         "timestamp": timestamps, "open": [1.0, 1.0, 1.0], "high": [1.1, 1.1, 1.1],
         "low": [0.9, 0.9, 0.9], "close": [1.0, 1.0, 1.0], "provider": "test",
