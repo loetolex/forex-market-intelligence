@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app import paper_trading
 
 
@@ -18,13 +20,13 @@ def _opportunity(side: str = "LONG") -> dict:
 def test_long_exit_framework_is_valid():
     result = paper_trading._validate_exit_framework(_opportunity("LONG"), "15m")
     assert result["approved"] is True
-    assert result["risk_reward"] == 1.5
+    assert result["risk_reward"] == pytest.approx(1.5)
 
 
 def test_short_exit_framework_is_valid():
     result = paper_trading._validate_exit_framework(_opportunity("SHORT"), "15m")
     assert result["approved"] is True
-    assert result["risk_reward"] == 1.5
+    assert result["risk_reward"] == pytest.approx(1.5)
 
 
 def test_invalid_long_exit_geometry_is_rejected():
@@ -35,7 +37,13 @@ def test_invalid_long_exit_geometry_is_rejected():
     assert "LONG exit geometry is invalid" in result["reason"]
 
 
-def test_execution_gate_requires_risk_approval():
+def test_execution_gate_requires_risk_approval(monkeypatch):
+    # Isolate the risk gate from the separate deployment lock. The execution
+    # gate must reject an unapproved risk decision even when paper submission
+    # itself is enabled.
+    monkeypatch.setattr(paper_trading, "PAPER_ORDER_PLACEMENT_ENABLED", True)
+    monkeypatch.setattr(paper_trading.settings, "trading_mode", "PAPER")
+    monkeypatch.setattr(paper_trading.settings, "live_trading_enabled", False)
     exit_framework = paper_trading._validate_exit_framework(_opportunity("LONG"), "15m")
     result = paper_trading._execution_gate(
         {"approved": False, "reason": "INSUFFICIENT_EDGE"},
