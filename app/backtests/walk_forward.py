@@ -5,7 +5,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.models.multi_timeframe import _calibrate_probability, _classifier, _feature_frame
+from app.models.calibration import apply_probability_calibrator, fit_time_series_platt_calibrator
+from app.models.multi_timeframe import _classifier, _feature_frame
 
 
 def run_walk_forward_backtest(df: pd.DataFrame, refit_every: int = 24, min_train: int = 180, threshold: float = 0.55) -> dict[str, Any]:
@@ -16,7 +17,8 @@ def run_walk_forward_backtest(df: pd.DataFrame, refit_every: int = 24, min_train
 
     predictions: list[dict[str, Any]] = []
     model = None
-    calibrated_probability = None
+    calibrator = None
+    calibration_meta: dict[str, Any] = {}
     last_fit = -10**9
 
     for i in range(min_train, len(X)):
@@ -26,23 +28,25 @@ def run_walk_forward_backtest(df: pd.DataFrame, refit_every: int = 24, min_train
                 continue
             model = _classifier()
             model.fit(X.iloc[:train_end], y_direction.iloc[:train_end])
-            raw_train = model.predict_proba(X.iloc[:train_end])[:, 1]
-            cal_start = max(int(train_end * 0.80), min_train - 20)
-            if cal_start < train_end - 10:
-                # Calibrate only on observations strictly before the prediction point.
-                try:
-                    calibrated_probability, _ = _calibrate_probability(
-                        float(raw_train[-1]), X.iloc[:train_end], y_direction.iloc[:train_end]
-                    )
-                except Exception:
-                    calibrated_probability = None
+            try:
+                calibrator, calibration_meta = fit_time_series_platt_calibrator(
+                    X.iloc[:train_end],
+                    y_direction.iloc[:train_end],
+                    _classifier,
+                    min_train=min_train,
+                    refit_every=refit_every,
+                    min_calibration_rows=40,
+                )
+            except Exception as exc:
+                calibrator = None
+                calibration_meta = {
+                    "status": "NOT_CALIBRATED",
+                    "reason": f"CALIBRATION_ERROR:{type(exc).__name__}",
+                }
             last_fit = i
 
         raw_p = float(model.predict_proba(X.iloc[[i]])[:, 1][0])
-        # Calibration is represented by the model's latest valid calibration status;
-        # for the actual point-in-time prediction, use the raw probability if a
-        # point-specific calibrated transform is not available.
-        p = raw_p if calibrated_probability is None else raw_p
+        p = apply_probability_calibrator(raw_p, calibrator)
         direction = 1 if p >= threshold else -1 if p <= (1.0 - threshold) else 0
         realized = float(y_return.iloc[i])
         strategy_return = float(direction * realized)
@@ -83,4 +87,6 @@ def run_walk_forward_backtest(df: pd.DataFrame, refit_every: int = 24, min_train
         "oos_start_index": int(frame["index"].iloc[0]),
         "oos_end_index": int(frame["index"].iloc[-1]),
         "execution_authorized": False,
+        "calibration": calibration_meta,
+        "calibration_data_role": "DEVELOPMENT_ONLY_OOS_PREDICTIONS",
     }
