@@ -21,7 +21,7 @@ from app.paper_trading import (
     start_auto_trader,
 )
 
-app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.4.0")
+app = FastAPI(title="Forex Intelligence IBKR Local Bridge", version="0.5.0")
 
 BRIDGE_TOKEN = os.getenv("IBKR_BRIDGE_TOKEN", "")
 # The performance monitor is diagnostic only and must not interfere with the
@@ -157,6 +157,34 @@ def account(_: None = Auth):
 def positions(_: None = Auth):
     return get_ibkr_adapter().get_positions()
 
+
+@app.get("/contracts/search")
+def contracts_search(
+    pattern: str = Query(min_length=1, max_length=40),
+    limit: int = Query(default=50, ge=1, le=100),
+    _: None = Auth,
+):
+    """Read-only IBKR contract discovery; never returns prices or places orders."""
+    try:
+        return get_ibkr_adapter().search_contracts(pattern, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"IBKR DISCOVERY UNAVAILABLE: {exc}") from exc
+
+
+@app.get("/contracts/{con_id}")
+def contract_by_conid(
+    con_id: int,
+    _: None = Auth,
+):
+    """Read-only authoritative contract details for an IBKR conId."""
+    try:
+        return get_ibkr_adapter().get_contract_details_by_conid(con_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"IBKR DISCOVERY UNAVAILABLE: {exc}") from exc
 
 @app.get("/contract/{symbol:path}")
 def contract(symbol: str, _: None = Auth):
