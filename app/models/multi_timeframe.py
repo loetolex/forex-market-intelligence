@@ -6,19 +6,20 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, brier_score_loss, mean_squared_error
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+
+from app.models.calibration import apply_probability_calibrator, fit_time_series_platt_calibrator
 
 from app.features.technical import add_features
 
-MODEL_VERSION = "research-candidate-hgb-mtf-v1"
+MODEL_VERSION = "research-candidate-hgb-mtf-v2"
 MIN_ROWS = 180
 MIN_TRAIN = 120
 VALIDATION_FOLDS = 4
 VALIDATION_TEST = 20
-CALIBRATION_FRACTION = 0.20
+CALIBRATION_REFIT_EVERY = 20
+MIN_CALIBRATION_ROWS = 40
 FINAL_HOLDOUT_FRACTION = 0.20
 MIN_HOLDOUT_ROWS = 20
 MIN_HOLDOUT_ROWS_90D = 90
@@ -349,47 +350,15 @@ def _walk_forward_validate(
     }
 
 
-def _calibration_split_size(n_development_rows: int) -> int:
-    return max(MIN_TRAIN, int(n_development_rows * (1.0 - CALIBRATION_FRACTION)))
-
-
-def _calibrate_probability(raw_probability: float, X: pd.DataFrame, y_direction: pd.Series) -> tuple[float, dict[str, Any]]:
-    n = len(X)
-    cal_start = _calibration_split_size(n)
-    if cal_start >= n - 10:
-        return raw_probability, {
-            "status": "NOT_CALIBRATED",
-            "reason": "INSUFFICIENT_CALIBRATION_HISTORY",
-            "data_role": "DEVELOPMENT_ONLY",
-        }
-    train_idx, cal_idx = np.arange(cal_start), np.arange(cal_start, n)
-    clf = _classifier()
-    clf.fit(X.iloc[train_idx], y_direction.iloc[train_idx])
-    p_cal = np.clip(clf.predict_proba(X.iloc[cal_idx])[:, 1], 1e-6, 1 - 1e-6)
-    y_cal = y_direction.iloc[cal_idx].to_numpy()
-    if len(np.unique(y_cal)) < 2:
-        return raw_probability, {
-            "status": "NOT_CALIBRATED",
-            "reason": "CALIBRATION_SET_SINGLE_CLASS",
-            "data_role": "DEVELOPMENT_ONLY",
-        }
-    logits = np.log(p_cal / (1.0 - p_cal)).reshape(-1, 1)
-    calibrator = Pipeline([
-        ("scale", StandardScaler()),
-        ("logistic", LogisticRegression(random_state=42)),
-    ])
-    calibrator.fit(logits, y_cal)
-    raw = float(np.clip(raw_probability, 1e-6, 1 - 1e-6))
-    calibrated = float(calibrator.predict_proba(np.array([[np.log(raw / (1 - raw))]]))[:, 1][0])
-    brier = float(brier_score_loss(y_cal, calibrator.predict_proba(logits)[:, 1]))
-    return calibrated, {
-        "status": "CALIBRATED",
-        "method": "platt_scaling",
-        "calibration_rows": int(len(cal_idx)),
-        "brier": brier,
-        "data_role": "DEVELOPMENT_ONLY",
-    }
-
+def _fit_calibrator(X: pd.DataFrame, y_direction: pd.Series) -> tuple[Any | None, dict[str, Any]]:
+    return fit_time_series_platt_calibrator(
+        X,
+        y_direction,
+        _classifier,
+        min_train=MIN_TRAIN,
+        refit_every=CALIBRATION_REFIT_EVERY,
+        min_calibration_rows=MIN_CALIBRATION_ROWS,
+    )
 
 def _regime(df: pd.DataFrame) -> dict[str, Any]:
     x = add_features(df.copy())
@@ -444,11 +413,11 @@ def forecast_timeframe(df: pd.DataFrame, instrument: str, timeframe: str, horizo
     reg.fit(X.iloc[:development_rows], y_return.iloc[:development_rows])
     latest = X.tail(1)
     raw_p = float(np.clip(clf.predict_proba(latest)[:, 1][0], 0.0, 1.0))
-    calibrated_p, calibration = _calibrate_probability(
-        raw_p,
+    calibrator, calibration = _fit_calibrator(
         X.iloc[:development_rows],
         y_direction.iloc[:development_rows],
     )
+    calibrated_p = apply_probability_calibrator(raw_p, calibrator)
     expected_return = float(reg.predict(latest)[0])
     residuals = y_return.iloc[:development_rows] - reg.predict(X.iloc[:development_rows])
     uncertainty = float(np.nanstd(residuals)) if len(residuals) > 5 else np.nan
