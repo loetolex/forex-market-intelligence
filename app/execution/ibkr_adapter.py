@@ -137,6 +137,120 @@ class IBKRAdapter:
             raise RuntimeError(f"BROKER DATA UNAVAILABLE: IBKR could not qualify {normalized}.")
         return qualified[0]
 
+    def search_contracts(self, pattern: str, limit: int = 50) -> dict[str, Any]:
+        """Read-only IBKR contract discovery for non-FX and FX instruments.
+
+        ``reqMatchingSymbols`` is intentionally separated from the existing
+        FX-only qualification path. Discovery returns contract metadata only;
+        it does not fetch prices, place orders, or authorize execution.
+        """
+        value = str(pattern or "").strip()
+        if not value:
+            raise ValueError("BROKER DISCOVERY: pattern is required.")
+        if len(value) > 40:
+            raise ValueError("BROKER DISCOVERY: pattern is too long.")
+        capped_limit = max(1, min(int(limit), 100))
+
+        ib = self._connected_ib()
+        matches = ib.reqMatchingSymbols(value)
+        rows: list[dict[str, Any]] = []
+        for description in list(matches or [])[:capped_limit]:
+            contract = getattr(description, "contract", None)
+            if contract is None:
+                continue
+            rows.append({
+                "con_id": int(getattr(contract, "conId", 0) or 0),
+                "symbol": getattr(contract, "symbol", None),
+                "sec_type": getattr(contract, "secType", None),
+                "exchange": getattr(contract, "exchange", None),
+                "primary_exchange": getattr(contract, "primaryExchange", None),
+                "currency": getattr(contract, "currency", None),
+                "local_symbol": getattr(contract, "localSymbol", None),
+                "trading_class": getattr(contract, "tradingClass", None),
+                "last_trade_date_or_contract_month": getattr(contract, "lastTradeDateOrContractMonth", None),
+                "strike": _finite_float(getattr(contract, "strike", None)),
+                "right": getattr(contract, "right", None),
+                "multiplier": getattr(contract, "multiplier", None),
+                "description": getattr(contract, "description", None),
+                "derivative_sec_types": list(getattr(description, "derivativeSecTypes", None) or []),
+                "data_status": "REAL_BROKER_DATA",
+            })
+
+        return {
+            "status": "REAL_BROKER_DATA",
+            "broker": "INTERACTIVE_BROKERS",
+            "pattern": value,
+            "matches_returned": len(rows),
+            "results": rows,
+            "execution_authorized": False,
+        }
+
+    def get_contract_details_by_conid(self, con_id: int) -> dict[str, Any]:
+        """Return authoritative contract details for an IBKR conId."""
+        try:
+            normalized_con_id = int(con_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("BROKER DISCOVERY: con_id must be an integer.") from exc
+        if normalized_con_id <= 0:
+            raise ValueError("BROKER DISCOVERY: con_id must be positive.")
+
+        ibi = self._library()
+        ib = self._connected_ib()
+        contract = ibi.Contract(conId=normalized_con_id)
+        details = ib.reqContractDetails(contract)
+        if not details:
+            raise RuntimeError(f"BROKER DATA UNAVAILABLE: no contract details for conId {normalized_con_id}.")
+
+        detail = details[0]
+        resolved = detail.contract
+        return {
+            "status": "REAL_BROKER_DATA",
+            "broker": "INTERACTIVE_BROKERS",
+            "contract": {
+                "con_id": int(getattr(resolved, "conId", normalized_con_id) or normalized_con_id),
+                "symbol": getattr(resolved, "symbol", None),
+                "sec_type": getattr(resolved, "secType", None),
+                "exchange": getattr(resolved, "exchange", None),
+                "primary_exchange": getattr(resolved, "primaryExchange", None),
+                "currency": getattr(resolved, "currency", None),
+                "local_symbol": getattr(resolved, "localSymbol", None),
+                "trading_class": getattr(resolved, "tradingClass", None),
+                "last_trade_date_or_contract_month": getattr(resolved, "lastTradeDateOrContractMonth", None),
+                "strike": _finite_float(getattr(resolved, "strike", None)),
+                "right": getattr(resolved, "right", None),
+                "multiplier": getattr(resolved, "multiplier", None),
+                "description": getattr(resolved, "description", None),
+            },
+            "details": {
+                "market_name": getattr(detail, "marketName", None),
+                "long_name": getattr(detail, "longName", None),
+                "industry": getattr(detail, "industry", None),
+                "category": getattr(detail, "category", None),
+                "subcategory": getattr(detail, "subcategory", None),
+                "time_zone_id": getattr(detail, "timeZoneId", None),
+                "trading_hours": getattr(detail, "tradingHours", None),
+                "liquid_hours": getattr(detail, "liquidHours", None),
+                "valid_exchanges": getattr(detail, "validExchanges", None),
+                "contract_month": getattr(detail, "contractMonth", None),
+                "real_expiration_date": getattr(detail, "realExpirationDate", None),
+                "last_trade_time": getattr(detail, "lastTradeTime", None),
+                "under_con_id": int(getattr(detail, "underConId", 0) or 0),
+                "under_symbol": getattr(detail, "underSymbol", None),
+                "under_sec_type": getattr(detail, "underSecType", None),
+                "market_rule_ids": getattr(detail, "marketRuleIds", None),
+                "min_tick": _finite_float(getattr(detail, "minTick", None)),
+                "min_size": _finite_float(getattr(detail, "minSize", None)),
+                "size_increment": _finite_float(getattr(detail, "sizeIncrement", None)),
+                "suggested_size_increment": _finite_float(getattr(detail, "suggestedSizeIncrement", None)),
+                "order_types": getattr(detail, "orderTypes", None),
+                "stock_type": getattr(detail, "stockType", None),
+                "sec_id_list": [
+                    {"tag": getattr(item, "tag", None), "value": getattr(item, "value", None)}
+                    for item in list(getattr(detail, "secIdList", None) or [])
+                ],
+            },
+            "execution_authorized": False,
+        }
     def get_account(self) -> dict[str, Any]:
         ib = self._connected_ib()
         values = ib.accountValues()
